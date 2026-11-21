@@ -437,6 +437,22 @@ export interface ElectronAPI {
   /** 打开文件选择对话框 */
   openFileDialog: () => Promise<FileDialogResult>
 
+  /** GuiJu（ADR 0044）：通用「选择文件路径」对话框（返回路径而非文件内容） */
+  selectFiles: (options?: {
+    title?: string
+    multi?: boolean
+    filters?: { name: string; extensions: string[] }[]
+  }) => Promise<{ canceled: boolean; paths: string[] }>
+
+  /** GuiJu（ADR 0044）：open-plan 内嵌浏览器视图边界上报 */
+  browserSetBounds: (
+    key: string,
+    bounds: { x?: number; y?: number; width?: number; height?: number }
+  ) => Promise<{ ok: boolean }>
+
+  /** GuiJu（ADR 0044）：open-plan 内嵌浏览器视图可见性 */
+  browserSetVisible: (key: string, visible: boolean) => Promise<{ ok: boolean }>
+
   /** 提取附件文档的文本内容 */
   extractAttachmentText: (localPath: string) => Promise<string>
 
@@ -1707,6 +1723,23 @@ const electronAPI: ElectronAPI = {
 
   openFileDialog: () => {
     return ipcRenderer.invoke(CHAT_IPC_CHANNELS.OPEN_FILE_DIALOG)
+  },
+
+  // ===== GuiJu（open-plan 嵌入，ADR 0044）：通用「选择文件路径」对话框 =====
+  selectFiles: (options?: {
+    title?: string
+    multi?: boolean
+    filters?: { name: string; extensions: string[] }[]
+  }): Promise<{ canceled: boolean; paths: string[] }> => {
+    return ipcRenderer.invoke('guiju:select-files', options)
+  },
+
+  // open-plan 内嵌浏览器视图边界上报/可见性（preload IPC 直达，ADR 0044 P2）
+  browserSetBounds: (key: string, bounds: { x?: number; y?: number; width?: number; height?: number }): Promise<{ ok: boolean }> => {
+    return ipcRenderer.invoke('guiju:browser-set-bounds', key, bounds)
+  },
+  browserSetVisible: (key: string, visible: boolean): Promise<{ ok: boolean }> => {
+    return ipcRenderer.invoke('guiju:browser-set-visible', key, visible)
   },
 
   extractAttachmentText: (localPath: string) => {

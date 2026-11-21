@@ -8,10 +8,79 @@
  * 调用方按各自回退路径执行（<input type=file> / 服务端接口）。
  */
 
+/**
+ * Proma 壳适配（ADR 0044 / 计划 2026-11-21-002 P2）。
+ * Proma preload 暴露 window.electronAPI（白名单桥），把其既有能力映射为
+ * open-plan 宿主契约（__OAW_HOST__）；缺口经 guiju:select-files IPC 最小追加。
+ * 注意重名陷阱：Proma 的 openFile = 系统打开（≠ open-plan 的「选择文件」）。
+ */
+function createPromaBridge(api) {
+  return {
+    isDesktop: true,
+    async openFile(options) {
+      // selectFiles（ADR 0044 追加）：返回 {canceled, paths}，契约一致
+      if (typeof api.selectFiles === "function") {
+        return api.selectFiles({
+          title: options?.title,
+          filters: options?.filters,
+        });
+      }
+      return { canceled: true, paths: [] };
+    },
+    async openDirectory(options) {
+      if (typeof api.openFolderDialog === "function") {
+        const result = await api.openFolderDialog();
+        return result ? { canceled: false, paths: [result.path] } : { canceled: true, paths: [] };
+      }
+      return { canceled: true, paths: [] };
+    },
+    async openPath(target) {
+      if (typeof api.systemOpenFile === "function") {
+        try {
+          await api.systemOpenFile(String(target));
+          return { ok: true, error: "" };
+        } catch (error) {
+          return { ok: false, error: String(error?.message || error) };
+        }
+      }
+      return { ok: false, error: "宿主未提供 systemOpenFile" };
+    },
+    async showItemInFolder(target) {
+      if (typeof api.showItemInFolder === "function") {
+        try {
+          const ok = await api.showItemInFolder(String(target));
+          return { ok: Boolean(ok), error: "" };
+        } catch (error) {
+          return { ok: false, error: String(error?.message || error) };
+        }
+      }
+      return { ok: false, error: "宿主未提供 showItemInFolder" };
+    },
+    // 内嵌浏览器视图边界上报：preload IPC 直达（ADR 0044 P2，与自研壳 __OAW_HOST__.browser 同构）
+    browser: {
+      async setBounds(key, bounds) {
+        if (typeof api.browserSetBounds !== "function") return { ok: false };
+        try { return await api.browserSetBounds(String(key), bounds || {}); } catch { return { ok: false }; }
+      },
+      async setVisible(key, visible) {
+        if (typeof api.browserSetVisible !== "function") return { ok: false };
+        try { return await api.browserSetVisible(String(key), visible !== false); } catch { return { ok: false }; }
+      },
+    },
+  };
+}
+
 /** 读取 preload 注入的宿主桥（不存在即浏览器形态）。 */
 export function hostBridge() {
   if (typeof window === "undefined") return null;
-  return window.__OAW_HOST__ || null;
+  if (window.__OAW_HOST__) return window.__OAW_HOST__;
+  const api = window.electronAPI;
+  if (api && typeof api === "object" && typeof api.selectFiles === "function") {
+    // 缓存适配桥，保证多次调用返回同一对象
+    if (!window.__OAW_PROMA_BRIDGE__) window.__OAW_PROMA_BRIDGE__ = createPromaBridge(api);
+    return window.__OAW_PROMA_BRIDGE__;
+  }
+  return null;
 }
 
 /** 是否桌面宿主。 */

@@ -222,6 +222,7 @@ import {
 import { extractTextFromAttachment } from './lib/document-parser'
 import { getUserProfile, updateUserProfile } from './lib/user-profile-service'
 import { getSettings, updateSettings } from './lib/settings-service'
+import { setBrowserViewBounds, setBrowserViewVisible } from './open-plan-browser-host'
 import { refreshAgentIslandConfiguration, markAgentIslandSessionViewed } from './lib/agent-island-service'
 import { getAgentStatusHoverWindow } from './agent-status-hover-window'
 import { setDockBadgeCount } from './lib/dock-badge-service'
@@ -2168,6 +2169,37 @@ export function registerIpcHandlers(): void {
       return openFileDialog()
     }
   )
+
+  // ===== GuiJu（open-plan 嵌入，ADR 0044）=====
+  // 通用「选择文件路径」对话框：返回路径而非文件内容（open-plan 平台桥契约需要路径）。
+  // 与 OPEN_FILE_DIALOG（内容式，供 Agent 直接读取）互补，不改变其行为。
+  ipcMain.handle(
+    'guiju:select-files',
+    async (
+      _,
+      options?: { title?: string; multi?: boolean; filters?: { name: string; extensions: string[] }[] }
+    ): Promise<{ canceled: boolean; paths: string[] }> => {
+      const win = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+      if (!win) return { canceled: true, paths: [] }
+      const props: Array<'openFile' | 'multiSelections'> = ['openFile']
+      if (options?.multi !== false) props.push('multiSelections')
+      const result = await dialog.showOpenDialog(win, {
+        title: options?.title || '选择文件',
+        properties: props,
+        filters: options?.filters,
+      })
+      return { canceled: result.canceled, paths: result.canceled ? [] : result.filePaths }
+    }
+  )
+
+  // open-plan 内嵌浏览器视图边界上报（client 经 preload IPC 直达，不经 HTTP 桥）。
+  // 桥（HTTP/WS）仅服务 server 侧 browser_* 工具的 CDP transport（跨进程必需）。
+  ipcMain.handle('guiju:browser-set-bounds', async (_, key: string, bounds: Record<string, unknown>) => {
+    return { ok: await setBrowserViewBounds(String(key || ''), bounds || {}) }
+  })
+  ipcMain.handle('guiju:browser-set-visible', async (_, key: string, visible: boolean) => {
+    return { ok: await setBrowserViewVisible(String(key || ''), visible !== false) }
+  })
 
   // 提取附件文档的文本内容
   ipcMain.handle(

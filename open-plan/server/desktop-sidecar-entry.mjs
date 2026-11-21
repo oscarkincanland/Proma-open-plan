@@ -47,6 +47,10 @@ if (!outFile) {
 }
 
 try {
+  // ADR 0044 P2：宿主桥参数透传为 env（server/index.mjs 监听后按 env 注入远程浏览器宿主）
+  if (args["browser-bridge"]) process.env.OAW_BROWSER_HOST_BRIDGE = String(args["browser-bridge"]);
+  if (args["bridge-token"]) process.env.OAW_BRIDGE_TOKEN = String(args["bridge-token"]);
+
   const service = await startDesktopService({
     projectDir,
     userDataDir: args["user-data-dir"] ? String(args["user-data-dir"]) : "",

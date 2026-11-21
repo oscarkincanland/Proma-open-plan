@@ -20,6 +20,11 @@ import { existsSync, readFileSync, rmSync, mkdtempSync } from 'fs'
 import { join, resolve } from 'path'
 import { tmpdir } from 'os'
 import { app, dialog } from 'electron'
+import {
+  startOpenPlanBrowserHost,
+  stopOpenPlanBrowserHost,
+  setOpenPlanBrowserHostWindowGetter,
+} from './open-plan-browser-host'
 
 const RESTART_LIMIT = 3
 const READY_TIMEOUT_MS = 60_000
@@ -90,18 +95,33 @@ function waitForReady(): Promise<OpenPlanSidecarHandle> {
   })
 }
 
-function spawnSidecar(): ChildProcess {
+async function spawnSidecar(): Promise<ChildProcess> {
   const root = resolveOpenPlanRoot()
   const entry = join(root, 'server', 'desktop-sidecar-entry.mjs')
   const clientDist = join(root, 'client', 'dist')
   const workDir = mkdtempSync(join(tmpdir(), 'guiju-sidecar-'))
   readyFile = join(workDir, 'ready.json')
 
+  // ADR 0044 P2：起浏览器宿主桥（仅回环），把地址与 token 注入 sidecar env——
+  // server 经 OAW_BROWSER_HOST_BRIDGE 注入远程宿主，browser_* 工具驱动 main 的 WebContentsView。
+  // 桥必须在 spawn 前就绪（env 无法事后注入）；失败不阻断 sidecar（浏览器回落 system 驱动）。
+  let bridgeEnv: Record<string, string> = {}
+  try {
+    setOpenPlanBrowserHostWindowGetter(getMainWindowRef)
+    const bridge = await startOpenPlanBrowserHost()
+    bridgeEnv = {
+      OAW_BROWSER_HOST_BRIDGE: bridge.url,
+      OAW_BRIDGE_TOKEN: bridge.token,
+    }
+    console.log('[open-plan sidecar] 浏览器宿主桥就绪', bridge.url)
+  } catch (error) {
+    console.error('[open-plan sidecar] 浏览器宿主桥启动失败（浏览器回落 system 驱动）:', error)
+  }
+
   const env: NodeJS.ProcessEnv = {
     ...process.env,
     ELECTRON_RUN_AS_NODE: '1',
-    // sidecar 内禁用 Electron 专有分支，保持纯 Node 语义
-    ELECTRON_NO_ATTACH_CONSOLE: undefined,
+    ...bridgeEnv,
   }
   const args = [
     entry,
@@ -110,6 +130,10 @@ function spawnSidecar(): ChildProcess {
     '--user-data-dir', join(app.getPath('userData'), 'guiju-data'),
     '--client-dist', clientDist,
   ]
+  if (bridgeEnv.OAW_BROWSER_HOST_BRIDGE) {
+    args.push('--browser-bridge', bridgeEnv.OAW_BROWSER_HOST_BRIDGE)
+    args.push('--bridge-token', bridgeEnv.OAW_BRIDGE_TOKEN)
+  }
   const proc = spawn(process.execPath, args, {
     cwd: root,
     env,
@@ -150,8 +174,11 @@ function scheduleRestart(): void {
     try {
       rmSync(readyFile, { force: true })
     } catch {}
-    child = spawnSidecar()
-    void waitForReady()
+    void spawnSidecar()
+      .then((proc) => {
+        child = proc
+        return waitForReady()
+      })
       .then((result) => {
         handle = result
         restartCount = 0
@@ -190,19 +217,20 @@ export async function startOpenPlanSidecar(): Promise<OpenPlanSidecarHandle> {
   if (!isOpenPlanEmbedEnabled()) throw new Error('GUIJU_EMBED_OPENPLAN 未开启')
   stopping = false
   restartCount = 0
-  child = spawnSidecar()
+  child = await spawnSidecar()
   handle = await waitForReady()
   console.log(`[open-plan sidecar] 就绪 ${handle.url}`)
   return handle
 }
 
-/** 优雅停止：SIGTERM → 5s 超时 → 强杀。 */
+/** 优雅停止：SIGTERM → 5s 超时 → 强杀；同时清理浏览器宿主桥。 */
 export function stopOpenPlanSidecar(): void {
   stopping = true
   if (restartTimer) {
     clearTimeout(restartTimer)
     restartTimer = null
   }
+  stopOpenPlanBrowserHost()
   const proc = child
   child = null
   if (!proc || proc.exitCode !== null) return

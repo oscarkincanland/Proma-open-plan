@@ -2560,6 +2560,8 @@ app.post("/api/search/test", async (req, res) => {
 });
 
 // ---------- 内置浏览器（画面流 / 用户接管） ----------
+// ADR 0044（Proma 壳）：client 侧视图边界上报经 preload IPC 直达 main（不经本服务）；
+// server 侧 browser_* 工具经远程宿主（OAW_BROWSER_HOST_BRIDGE）的 HTTP/WS 桥驱动视图。
 app.get("/api/browser/state", (req, res) => {
   const client = String(req.query.client || "");
   const thread = String(req.query.thread || "");
@@ -7998,6 +8000,17 @@ httpServer = app.listen(PORT, HOST, () => {
   console.log(`Open Plan（规聚）running at http://${HOST}:${PORT}`);
   console.log(`workspace: ${WORKSPACE_DIR}`);
   if (API_TOKEN) console.log("API authentication enabled (use /?token=<OAW_API_TOKEN> for the browser UI).");
+  // ADR 0044（Proma 壳 sidecar 形态）：宿主桥 env 存在时注入远程浏览器宿主，
+  // browser_* 工具经桥驱动 Proma main 的 WebContentsView（embedded 驱动）。
+  // web 形态 / 自研 desktop 壳（同进程注入）不受影响。
+  import("./平台/远程浏览器宿主.mjs")
+    .then(({ installRemoteBrowserHostFromEnv }) => installRemoteBrowserHostFromEnv())
+    .then((injected) => {
+      if (injected) console.log("[browser] 已注入 Proma 宿主桥远程宿主（embedded 驱动）。");
+    })
+    .catch((error) => {
+      console.warn(`[browser] 远程宿主注入失败（回落 system 驱动）：${String(error?.message || error).slice(0, 200)}`);
+    });
   // 预热共享 ModelRuntime（模型目录/凭据/供应商缓存为全局单例）：
   // 让第一个会话的冷启动成本在服务启动时先行承担，用户首条消息不再等待目录加载。
   void agentManager.modelRuntime().catch((error) => {
