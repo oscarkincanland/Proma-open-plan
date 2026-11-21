@@ -129,6 +129,9 @@ async function spawnSidecar(): Promise<ChildProcess> {
     '--out', readyFile,
     '--user-data-dir', join(app.getPath('userData'), 'guiju-data'),
     '--client-dist', clientDist,
+    // 资源根（officecli/LibreDWG bin 解析）：dev = open-plan 树根（bin/ 按清单就位），
+    // 打包态 = resources/open-plan（extraResources 已携带 bin/**）
+    '--resources-dir', root,
   ]
   if (bridgeEnv.OAW_BROWSER_HOST_BRIDGE) {
     args.push('--browser-bridge', bridgeEnv.OAW_BROWSER_HOST_BRIDGE)

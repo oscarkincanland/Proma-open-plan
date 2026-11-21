@@ -90,6 +90,24 @@ extraResources:
     to: startup-splash
     filter:
       - "**/*"
+  # ===== GuiJu（open-plan 应用内核，ADR 0044 / 计划 2026-11-21-002 P5）=====
+  # sidecar（ELECTRON_RUN_AS_NODE）执行 open-plan/server/服务入口.mjs 所需的完整闭包：
+  # server 源码（原生 ESM，不进 asar）、client/dist 静态资源、生产依赖、bin 清单与二进制、
+  # Review 模式的本地规范依据（docs/规范）。打包机需先在 open-plan/ 下完成
+  # npm ci --omit=dev 与 npm run build（client/dist）。GIS 基础数据（zhejiang_osm 等）
+  # 不入 git、不随包，真机按项目规范放置到用户数据目录。
+  - from: ../open-plan
+    to: open-plan
+    filter:
+      - server/**/*
+      - client/dist/**/*
+      - package.json
+      - package-lock.json
+      - node_modules/**/*
+      - bin/清单.json
+      - bin/**/*
+      - docs/规范/**/*
+      - docs/决策记录/**/*
 
 # ============================================
 # macOS 配置
