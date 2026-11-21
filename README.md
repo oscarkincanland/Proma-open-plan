@@ -4,6 +4,20 @@
 
 
 
+## GuiJu（规聚桌面版）衍生说明（ADR 0044）
+
+> **本仓库是 [proma-ai/Proma](https://github.com/proma-ai/Proma)（AGPL-3.0）的衍生作品。**
+> `open-plan/` 目录承载 [Open Plan（规聚）](https://github.com/oscarkincanland/open-plan)应用内核
+> （交通规划工程师的 AI 工作台：文档办公、地图 GIS、创作画布、知识库等 R1–R17 全量能力），
+> 以 sidecar 子进程（`ELECTRON_RUN_AS_NODE`）运行于 Proma Electron 壳内，主窗口加载其 React SPA。
+>
+> - **许可**：依据 AGPL-3.0 及其网络使用条款，本衍生作品整体以 AGPL-3.0 提供；
+>   上游 Proma 的版权与 LICENSE 声明逐字保留，本段为衍生关系披露。
+> - **源码获取**：分发（含打包产物提供网络交互）时须随附或指明本仓库完整源码；
+>   open-plan 原始源码见上方仓库链接（迁入基线 `develop @ 7a74623e`）。
+> - **不包含**：Proma 商业版的任何内容；GIS 基础数据（按项目规范另行放置）。
+> - 桌面产物冒烟：`apps/electron` 下 `node scripts/guiju-smoke.mjs --dir <win-unpacked>`。
+
 ## Proma 简介
 
 

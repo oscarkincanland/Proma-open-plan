@@ -45,7 +45,8 @@
     "dist:linux": "bun run build && bun run sync:runtime-deps && bun run rebuild:node-pty && electron-builder --linux",
     "dist:visual": "bun run scripts/dist.ts",
     "dist:fast": "bun run scripts/dist.ts --current-arch --dmg",
-    "dist:debug": "bun run scripts/dist.ts --current-arch --verbose"
+    "dist:debug": "bun run scripts/dist.ts --current-arch --verbose",
+    "guiju:smoke": "node scripts/guiju-smoke.mjs"
   },
   "dependencies": {
     "@codemirror/language": "^6.12.4",
