@@ -1,0 +1,225 @@
+# Open Plan（规聚）
+
+[![CI](https://github.com/oscarkincanland/open-plan/actions/workflows/ci.yml/badge.svg)](https://github.com/oscarkincanland/open-plan/actions/workflows/ci.yml)
+
+> 规划 + 聚集 —— 面向交通规划工程师的 AI 一体化工作台
+
+> **桌面端迁移说明（2026-11-21，ADR 0044）**：本目录是 open-plan（规聚）应用树整体迁入 Proma fork 的副本，迁入基线 `develop @ 7a74623e`。治理约定：
+> 1. `open-plan/` **不加入 Bun workspaces**（fork 根 workspaces 仅 `packages/*`、`apps/*`，天然排除），不参与 `bun install`；本树依赖一律在本目录内用 npm 安装（`npm install` / `npm ci`）。
+> 2. 本树验证门禁照旧：`npm run verify` 与全部 `test:*` 在本目录内以 npm 运行。
+> 3. 运行时产物（`node_modules/`、`client/dist/`、工作区数据、`.oaw/`）不入 git，由本目录 `.gitignore` 与 fork 根 `.gitignore` 共同覆盖。
+> 4. 桌面形态：Proma main 以 `ELECTRON_RUN_AS_NODE=1` spawn 本树 `server/服务入口.mjs` 作为 sidecar 子进程（随机端口 + token），主窗口 loadURL 加载本树 `client/dist`；server 不做进程内 import（`uncaughtException→exit` 语义与监督循环假设）。
+> 5. 许可：本 fork 整体遵循 AGPL-3.0（上游 Proma 传染），本树沿袭其原有许可与版权声明。
+
+基于 [Pi Agent SDK](https://github.com/nicepkg/pi-coding-agent) 的 Web 端规划工作台 + AI Agent 协作工具：Office 文档编辑、知识库、地图可视化、脑图、模板库一站式协同。前端设计参考 [Proma](https://github.com/proma-ai/Proma) 与 [siyuan](https://github.com/siyuan-note/siyuan) 项目。
+
+**规聚释义**：`规` = 规划（文档成果、规划报告、地图与图表），`聚` = 聚集（知识汇聚、文档反链、引用关系图谱）——为交通规划工程师提供"规划成果 + 知识汇聚 + 智能协作"的一体化工作台。
+
+## 目录结构
+
+```
+open-plan/
+├─ client/              # 前端（Vite + React）：对话流、工作台、预览器、地图、知识库
+│  ├─ src/components/   # 界面组件（ChatPanel / 工作产物面板 / 预览器 / 地图面板…）
+│  ├─ src/*.js          # 展示投影、事件注册表、运行轨迹归约等纯函数模块
+│  └─ dist/             # 构建产物（npm run build 生成，不入库）
+├─ server/              # 服务端（Express + Pi Agent SDK）：会话、Run、事件流、工具
+│  ├─ 运行开关.mjs       # 运行时开关族（RUNTIME_FLAGS，经 /api/status 下发前端）
+│  ├─ 事件注册表.mjs     # 事件类型登记 + 首批 8 个事件 schema
+│  └─ 工作流/            # 结构化工作流声明（注册表 + 校验 + 领域硬约束）
+├─ scripts/             # 回归测试与运维脚本（测试即脚本，node scripts/*.mjs）
+├─ templates/           # 文档/汇报模板库
+├─ docs/                # 规范、决策记录、计划、审计与实施记录
+│  ├─ 规范/             # 架构 / 代码 / 测试 / 文档管理长期规范
+│  └─ 决策记录/         # ADR（为什么这样选）
+├─ office-workspace/    # 默认工作区（用户文档不入库；maps/ 图层入库）
+├─ AGENTS.md            # 项目宪法：智能体能力边界与工程约束（AGENT.MD 为历史指针）
+├─ REQUIREMENTS.md      # 产品需求文档（PRD，R1–R16）
+├─ DESIGN.md            # 设计与体验规范（信息架构 / 组件 / 设计令牌）
+├─ 版本管理计划.md        # 分支策略 / 语义化版本 / 验证与发版流程
+└─ 变更日志.md           # 逐版本变更记录（语义化版本）
+```
+
+## 功能全景
+
+### 📄 文档办公
+- **Office 文档**：Word/PPT 客户端高保真渲染（docx-preview/pptxjs），批注/修订显示，批注点击**精确定位到段落**（黄底高亮 + 编号徽标）
+- **Excel**：多 sheet 查看、单元格编辑
+- **Markdown/HTML**：GFM 表格、KaTeX 公式、代码高亮、目录浮窗
+- **文档编辑**：Word 工具栏（字体/颜色/高亮/表格/目录导航）、新建空白 Word 文档
+- **文件管理**：上传/下载/删除/右键菜单、文件搜索、子目录导航（返回上一级）
+
+### 🤖 AI Agent 协作
+- **对话流**（pi-web BlockView 模型）：思考/工具调用/最终文本独立条目，无分组框；最终回复无边框与事件流宽度一致
+- **运行终态如实呈现**：`completed` / `failed` / `cancelled` 分色，`partial`（部分完成）/ `blocked`（受阻）用警示色而非成功色，运行失败不再显示成"任务完成"
+- **会话消息目录栏**：左侧 hover 展开消息时间线，点击定位（列表 + 键盘 + 顶部/底部跳转）
+- **主动询问（ask_user）**：agent 遇到任务不明确时弹窗提问（快捷选项 + 输入框，带超时回执），回答后继续，不再猜测
+- **ask 卡片 / 任务进度卡**：agent 回复中的 `- [ ]` 任务自动解析为可勾选进度条
+- **模型选择与切换**：90+ 模型图标化浮层（搜索 + [V] 视觉标记）、思考强度三档；**运行中切换模型会排队**，本轮结束后生效并显示切换分割线；模型失败进入可重试的错误态
+- **模型诊断**：设置页和 `/api/agent/diagnostics` 分层显示 SDK、模型目录、凭据、真实调用、Runtime 和最近失败记录（均不返回密钥）
+- **配置写入兜底**：Windows AppData 不允许创建临时文件时，自动切换项目内 `.oaw\\规聚`，导入不会因 `EPERM` 中断
+- **Chat / Work / Review 三模式**：Chat 只读检索；Work 调用完整工具链并写入工作区；Review 依据本地规范审查、生成报告与安全副本。Office CLI 是 Work/Review 的受控能力，不再作为独立模式（历史 `office` 会话统一显示为 Work）
+- **中断排空**：中断请求先进入 `run_draining` 排空窗口，再以 `aborted(drained:true)` 收束，时间线不留"半句话"被下一轮吞并
+- **子代理编排**：可派发隔离的只读子会话（scout/worker），子代理的写回审批带**归属标签**（`来自子代理 · xxx`），多子代理并发时不再分不清来源
+
+### 📚 知识库（Obsidian/siyuan 风格）
+- **三视图**：浏览 / 思维图谱 / 脑图
+- **文件树**：懒加载、目录可折叠、@ 到对话（文件与文件夹均可，支持一次 @ 多个）
+- **知识图谱**：G6 力导向，分组调色、hover 聚焦、节点大小 ∝ 引用度、缩放隐藏标签、局部图谱（1-hop）、边类型过滤（双向链接/内容相似/标签/目录）、隐藏孤立节点
+- **脑图**：大纲 ↔ 树状脑图双向联动 + 右侧文档预览
+- **全文搜索**：加权索引（标题×10/标签×6/正文×1）、IMA 云端知识库集成
+- **双向链接与反链**、`@知识库[路径@根目录]` 引用分析链路、kb_search/kb_read agent 工具
+
+### 🗺️ 地图可视化（GIS）
+- **MapLibre GL + 矢量瓦片**：浙江省交通基础图层（11 地市 + 90 区县边界、高速 28,526 段、国省道 19,546 段、收费站 404、枢纽 769）
+- **QGIS 风格图层面板**：分组、拖拽排序、符号缩略图、右键菜单（属性表/缩放/重命名/复制/删除）、样式编辑器
+- **属性表**：字段/搜索/排序/分页/CSV 导出、地图定位
+- **测量/绘制**：距离/面积/标绘点；**等时圈分析**（高德 Web 服务）
+- **数据导入**：.geojson/.json/.shp（浏览器解析）、agent 对话改图热更新
+- **Agent 地图工具**：`map_read` / `map_edit` / `map_import` / `map_analyze` / `map_template` / `map_save_analysis` / `map_clear_analysis` / `map_datasets`（读状态 / 改样式 / 导图层 / 空间分析 / 套模板 / 存分析 / 清理临时层）
+- **地图对话栏适配**：地图模式下对话栏紧凑呈现（360px 可拖拽）、顶部状态行（当前项目 + 视口）、地图工具卡片语义标识与"临时图层未保存"提示
+- **M2 宏观交通分析（开发中）**：流量带宽、OD 期望线、区域交换量和路网结构统计已形成演示闭环；当前数据为演示数据，不等同于真实交通调查数据
+
+### 📋 模板库
+- **318 个模板**：公文版面/工作汇报/研究报告/规划报告/行业研究/论文/会议通知/调研问卷/研究框架/图表地图/**OpenDesign HTML PPT（106 个）**/规划素材库（14 份交通规划详版模板）
+- **模板预览**：md 渲染 / HTML iframe 首页渲染 / Word/PDF/PPT
+- **@ 到对话**：预览面板「@ 模板」/「@📁 目录」，多次 @ 累积后统一插入；红头会议通知生成器（GB/T9704 版式）
+
+### 🧠 记忆与智能
+- **工作区记忆**：AGENTS.md + memory/ 每次对话前注入 agent 上下文；每轮完成后 Agent 会自动判断是否有长期信息，并通过 memory_update 生成待审核建议（项目信息/工作规则/用户偏好/经验教训）
+- **界面状态固化**：刷新/重开浏览器恢复到上次界面（文档 tabs/模式/工作区/最后会话）
+- **会话历史**：对话栏可折叠抽屉、标题智能清洗（跳过系统提示）、置顶/搜索/重命名/删除
+- **任务与产物追踪**：每轮任务生成 TaskEnvelope/run manifest，记录引用、工具事件和新增/修改/删除产物；**产物按 Run 归属分层**（本轮产物 / 历史产物），支持小文件显式回滚与成果验收台核对，会话支持 fork 分支
+- **结构化工作流**：技能工作流由服务端注册表声明并校验依赖，含**领域硬约束**（越界坐标、记录数不一致等 preflight 硬阻断）；聊天状态栏显示 run、引用和产物进度
+- **智能体广场**：保留内置 Agent 模板，并支持创建、编辑、删除自定义 Agent，配置持久化在项目 `.oaw` 目录
+
+### 🔌 模型供应商
+- **内置供应商目录**：以 Pi 内置快照为基底，并可合并 [models.dev](https://models.dev) 目录补充最新供应商与模型（缓存不存在时自动退回快照，离线可用）
+- **一键添加**：公开 HTTP + API Key 的供应商可一键导入（Base URL / 协议 / 模型能力自动带出，用户只补 Key）；云凭证类（Bedrock/Vertex/Azure 等）明确拒绝并说明原因
+- **登录方式区分**：以权威清单区分「账号登录（OAuth）」与「API Key」，不再靠关键字猜测；已配置状态与 OAuth 凭据均如实显示，响应不回显任何 Key 明文
+
+### 🎨 体验
+- 明暗主题、消息字体大小、批注高亮时长、思考块默认展开等**设置面板**可调
+- **无障碍与窄屏**：4 套主题对比度审计、窄屏抽屉降级、键盘可达
+- **动效治理**：持续动画白名单 + `data-reduce-motion` / 动效档位降级（信息不丢）
+- 品牌 Logo（规聚：网格 = 规划 + 汇聚节点 = 聚集）、加载占位防白屏
+
+> **Qoder 对标视觉层（opt-in · 默认关）**：整站配色、设计令牌三层结构（基础色阶 → 语义令牌 → 组件变量）与组件交互规范的视觉部分，全部收敛在独立开关后（`OAW_QODER_STYLE` 等，经 `/api/status` 下发），**默认关闭**，关闭时输出与基线逐字等价；支持功能级 / 文件级 / 整站级三层回滚。细节见 [DESIGN.md](DESIGN.md)。
+
+## 技术栈
+
+| 层 | 技术 |
+|---|---|
+| 前端 | React 18 + Vite 5、docx-preview/pptxjs、x-spreadsheet、MapLibre GL、antv G6 v5、react-markdown + KaTeX |
+| 后端 | Node.js + Express 5 + Pi Agent SDK（`@earendil-works/pi-coding-agent`）、geojson-vt 矢量瓦片、undici、officecli（Windows 文档引擎） |
+| 数据 | JSONL 会话存储、持久化事件存储、本地知识库索引（kb.mjs）、地图项目（style.json + 瓦片 + GeoJSON） |
+| AI | Pi SDK（90+ 模型）、自定义工具（officecli / kb / map / ask_user / memory_update / subagent…） |
+
+## 架构
+
+```
+浏览器 (React)
+┌──────────────┬──────────────┬──────────────┐
+│ 左侧栏        │ 文档/知识库/  │ 对话栏        │
+│ 文件树        │ 地图/模板库   │ 历史抽屉      │
+│ 产物/设置     │ 三栏布局      │ ask 卡片      │
+└──────┬───────┴──────┬───────┴──────┬───────┘
+       │ REST         │ REST/SSE     │ SSE/POST
+┌──────┴──────────────┴──────────────┴─────────┐
+│   Node.js Express (localhost:3002)           │
+│   /api/files|doc|agent|sessions|kb|map|tpl   │
+│   /api/memory|templates|workspace|runs       │
+│   长连接预算：/api/agent/stream|events        │
+│              /api/browser/stream|memory/stream│
+├──────────────────────────────────────────────┤
+│   officecli（文档）  Pi SDK（agent）          │
+│   MapLibre 瓦片      kb.mjs（知识库索引）     │
+└──────────────────────────────────────────────┘
+```
+
+## 快速开始
+
+### 前置条件
+- **Node.js** >= 22
+- **Pi agent** 可选：新电脑无需安装 Pi CLI，可在设置页直接配置模型凭据；已有 Pi 配置可通过"从本地 Pi 导入配置"一次性复制
+- **officecli**（Windows 文档编辑）：`npm run setup`，或手动 `powershell -c "irm https://d.officecli.ai/install.ps1 | iex"`
+
+### 安装与启动
+```bash
+npm install
+cd client && npm install && npm run build && cd ..
+npm start              # 服务监督在后台拉起 → http://localhost:3002
+# 需要前台日志/调试时：npm run start:foreground
+```
+
+首次使用进入「设置 → 模型供应商」：可以手动填写 Provider API Key，或用内置供应商库**一键添加**（自动带出 Base URL / 协议 / 模型能力），也可明确点击「从本地 Pi 导入配置」。导入默认不包含历史会话；如需迁移旧会话，再勾选「同时导入历史会话」。
+
+### 开发模式
+```bash
+npm run start:foreground     # 终端 1：后端（前台，便于看日志）
+cd client && npm run dev     # 终端 2：前端热更新（5173 代理 /api）
+```
+
+## 工程规范
+
+- [AGENTS.md](AGENTS.md) — 项目宪法：智能体能力边界、PRD/DESIGN 基线、领域硬约束、完成定义（DoD）
+- [产品需求文档（PRD）](REQUIREMENTS.md) — 目标用户、范围、R1–R16 需求、非功能与验收
+- [设计规范](DESIGN.md) — 信息架构、布局、组件交互、设计令牌、双主题、无障碍
+- [文档管理规范](docs/规范/文档管理规范.md) — 文档分层、命名、生命周期与索引
+- [架构规范](docs/规范/架构规范.md) — 分层、依赖方向、契约与扩展点
+- [代码规范](docs/规范/代码规范.md) — Node/React 编码、事件、安全与审查清单
+- [功能验证测试规范](docs/规范/功能验证测试规范.md) — 测试分层、回归地图、CI 与验收证据
+- [Office 排版规范](docs/规范/Office排版规范.md) — 版式令牌、模板路由、规则闸门与版式验收
+- [开发收敛规范](docs/规范/开发收敛规范.md) — 事实源唯一性与加工具/事件/文档/提交/版本的强制规约
+- [决策记录](docs/决策记录/决策记录索引.md) — 为什么这样选，放弃了什么
+
+## 质量门禁与验证
+
+| 命令 | 内容 |
+|---|---|
+| `npm run verify` | 语法检查（server 全部 .mjs）+ 前端构建 + API 冒烟测试 |
+| `npm run test:<名>` | 单个回归脚本（如 `test:conclusion` / `test:map-chat` / `test:provider-catalog`） |
+| `node scripts/CI运行测试.mjs <测试名>` | CI 同款包装器，把 `✗` 断言转成可读注解 |
+
+- **回归脚本**：70+ 个 `test:*`（源码级断言 + 接口级端到端），覆盖对话流/事件协议/地图/知识库/供应商目录/办公引擎等；`:live` 后缀的需要人工触发。
+- **CI**：[.github/workflows/ci.yml](.github/workflows/ci.yml) 在 push 到 `main` 与 PR 时跑 26 步回归（执行轨迹归约 / 事件注册表 / 任务结论事件流 / 成果可信度 / 动效治理 / 主任务流 / 对话流 / AVA 状态可信 / AVA 队列 / 草稿 / 历史分页 / 消息版本 / 长期目标 / 链接页签 / AVA 输入增强 / AVA 提问表单 / AVA 会话分组 / 长连接预算 / 地图五套 / 工作区隔离 / 供应商目录 / Review 修复），**一步失败即停**。
+
+## 版本历史
+
+当前**已发布**版本 **v0.13.3**（2026-10-29 合并收口并发布到 `main`，含 tag `v0.13.3`），逐版本记录见 [变更日志.md](变更日志.md)。其后 **v0.13.7–v0.13.19** 已在 `develop` 完成、**尚未发布**（含输入与体验能力、GIS 工程化、工作区画布整合、并发写锁与恢复隔离）；按 **v0.13.x 延伸线**推进，不启用 v0.14.0。版本状态的唯一裁决者是 [版本管理计划.md](版本管理计划.md)。
+
+v0.11 系列主要进展：
+- **对话状态可信**：压缩上下文期间禁止发送、停止/中断后回显保留队列条数、发送/停止三态；新增 `test:ava-trust` 源码契约与分层回归
+- **产物与成果**：产物归属分层（本轮/历史）、Run 级回滚、成果验收台、成果固定
+- **对话可信度**：运行终态如实呈现（含 partial/blocked 警示色）、中断排空、每轮用时与 token、执行轨迹归约
+- **事件与长连接**：事件注册表（~115 种）+ 持久化事件存储 + 事件 schema 校验；长连接预算（配额/去重/退避抖动）防切工作区/切会话卡死
+- **模型**：模型切换排队 + 每轮模型分割线、模型诊断分层、Pi 网络适配与配置独立化
+- **供应商目录**：内置快照 + models.dev 合并、一键添加、登录方式权威区分
+- **地图 Agent 化**：图层面板/属性表/测量绘制/等时圈、地图对话栏适配、M2 宏观交通分析演示闭环
+- **工作流**：服务端工作流注册表 + 依赖校验 + 领域硬约束
+- **设计体系**：设计令牌三层结构、Qoder 对标视觉层（opt-in 默认关）、无障碍与动效治理
+
+关键里程碑：
+- **v0.5.0** Office Viewer 集成（批注/修订渲染）
+- **v0.6.0** 知识库全屏模式 + 知识图谱 + 模板库
+- **v0.8.0** 地图可视化模式（MapLibre + 矢量瓦片）
+- **v0.8.4** 合并 0.7.5 分支：QGIS 图层面板/属性表/测量绘制/等时圈/siyuan 图谱
+- **v0.8.5** 脑图视图（大纲↔脑图联动）
+- **v0.8.12** 品牌重塑 Open Plan（规聚）+ Logo
+- **v0.8.21** ask_user 主动询问 + 全部自定义工具激活修复
+- **v0.8.22** 模板库/知识库 @ 重构 + HTML 预览修复 + 历史栏移到对话侧
+- **v0.8.23–v0.8.31** 知识图谱增强、地图标注/导出/批量导入/OD 热力/路径规划、OfficeCLI 内置、模型刷新与稳定性修复
+- **v0.9.28–v0.9.30** Chat / Agent 模式收敛、项目与会话沉淀、成果固定和记忆治理
+- **v0.9.31–v0.9.34** Office 成果验收、Pi Runtime 管理、真实并发/取消/重启回归、模型诊断接口
+- **v0.10.0–v0.10.1** 三栏工作台迁移、Pi 网络适配、配置独立目录、脱敏导入与模型网络设置
+- **v0.11.x** 见上方逐条进展与 [变更日志.md](变更日志.md)
+
+## 分支说明
+
+| 分支 | 说明 |
+|---|---|
+| `main` | 稳定发布分支（始终可运行）；由 `develop` 合并后打 `v主.次.补丁` 标签 |
+| `develop` | 集成分支；`feature/*` / `fix/*` 合并到此，稳定后合入 `main` |
+| `feature/*` / `fix/*` | 短生命周期分支，从 `develop` 拉出，跑通门禁后合并回 `develop` |
+
+版本管理遵循 [版本管理计划.md](版本管理计划.md)：语义化版本 + 轻量 trunk-based；提交信息采用 `类型(范围): 描述` 或 `类型: 描述`；每次合并必须 `npm run verify` 通过并更新 [变更日志.md](变更日志.md)。工程约束以 [AGENTS.md](AGENTS.md)、[PRD](REQUIREMENTS.md)、[DESIGN](DESIGN.md) 与 [docs/规范/](docs/规范/文档管理规范.md) 为准。

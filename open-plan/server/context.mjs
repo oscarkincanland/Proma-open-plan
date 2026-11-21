@@ -1,0 +1,572 @@
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import os from "node:os";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import JSZip from "jszip";
+import XLSX from "xlsx";
+import { PROJECT_DIR, getWorkspace, resolveExternalPath, resolvePath, listFileRoots } from "./workspace.mjs";
+import { RUNTIME_FLAGS } from "./运行开关.mjs";
+
+const execFileAsync = promisify(execFile);
+const MAX_READ_CHARS = 50000;
+// CAD agent 读取（开关 cadAgent，默认关）：开启后 DXF/DWG 可被 @引用/context_read 读取（CAD 方案 AC3）
+// 调用期求值（2026-11-19-002 阶段1）：cadAgent 热更后新的 @引用/context_read 即时生效。
+export function supportedDocumentExts() {
+  return new Set(["docx", "xlsx", "pptx", "pdf", "csv", "json", "md", "markdown", "txt", "html", "htm", ...(RUNTIME_FLAGS.cadAgent ? ["dxf", "dwg"] : [])]);
+}
+const MAX_DOCUMENT_CACHE_ENTRIES = 32;
+const MAX_DOCUMENT_CACHE_CHARS = 2_000_000;
+const documentReadCache = new Map();
+let documentCacheChars = 0;
+
+function cacheKeyFor(file, version, range) {
+  return `${file}|${version}|${JSON.stringify(range || {})}`;
+}
+
+function readCachedDocument(key) {
+  const hit = documentReadCache.get(key);
+  if (!hit) return null;
+  documentReadCache.delete(key);
+  documentReadCache.set(key, hit);
+  return hit.text;
+}
+
+function cacheDocument(key, text) {
+  const value = String(text || "");
+  if (!value || value.length > MAX_DOCUMENT_CACHE_CHARS) return;
+  const old = documentReadCache.get(key);
+  if (old) documentCacheChars -= old.text.length;
+  documentReadCache.delete(key);
+  documentReadCache.set(key, { text: value, cachedAt: new Date().toISOString() });
+  documentCacheChars += value.length;
+  while (documentReadCache.size > MAX_DOCUMENT_CACHE_ENTRIES || documentCacheChars > MAX_DOCUMENT_CACHE_CHARS) {
+    const first = documentReadCache.keys().next().value;
+    const item = documentReadCache.get(first);
+    documentReadCache.delete(first);
+    documentCacheChars -= item?.text?.length || 0;
+  }
+}
+
+export function clearReadCache() {
+  documentReadCache.clear();
+  documentCacheChars = 0;
+}
+
+function idFor(ref) {
+  return "ref_" + crypto.createHash("sha1").update(JSON.stringify(ref)).digest("hex").slice(0, 12);
+}
+
+function makeRef(kind, target, extra = {}) {
+  let cleanTarget = String(target || "").trim();
+  const cell = kind === "file" ? cleanTarget.match(/^(.*?)#([^!]+)!([A-Z]+\d+(?::[A-Z]+\d+)?)$/i) : null;
+  const locator = kind === "file" ? cleanTarget.match(/^(.*?)#(page|p|slide|paragraph)=(\d+)(?:-(\d+))?$/i) : null;
+  const element = kind === "canvas" ? cleanTarget.match(/^(.*?)#element=([A-Za-z0-9_-]{1,64})$/) : null;
+  const range = cell
+    ? { ...(extra.range || {}), sheet: cell[2], cell: cell[3] }
+    : locator
+      ? { ...(extra.range || {}), [locator[2].toLowerCase() === "p" ? "page" : locator[2].toLowerCase()]: Number(locator[3]), ...(locator[4] ? { end: Number(locator[4]) } : {}) }
+      : element
+        ? { ...(extra.range || {}), element: element[2] }
+        : extra.range;
+  if (cell) cleanTarget = cell[1];
+  if (locator) cleanTarget = locator[1];
+  if (element) cleanTarget = element[1];
+  const ref = { kind, target: cleanTarget, ...extra };
+  if (range) ref.range = range;
+  ref.id = idFor(ref);
+  return ref;
+}
+
+/** Parse the user-facing @ syntax into stable, serialisable Reference objects. */
+export function parseReferences(text = "") {
+  const out = [];
+  const seen = new Set();
+  const add = (ref) => {
+    if (!ref?.target) return;
+    const key = JSON.stringify({ kind: ref.kind, target: ref.target, rootId: ref.rootId, range: ref.range });
+    if (!seen.has(key)) { seen.add(key); out.push({ ...ref, id: idFor(ref) }); }
+  };
+  const source = String(text || "");
+  for (const m of source.matchAll(/@知识库目录\[([^\]]+)\]/g)) add(makeRef("knowledge_dir", m[1], { source: m[0] }));
+  for (const m of source.matchAll(/@知识库\[([^\]]+)\]/g)) add(makeRef("knowledge", m[1], { source: m[0] }));
+  for (const m of source.matchAll(/@模板目录\[([^\]]+)\]/g)) add(makeRef("template_dir", m[1], { source: m[0] }));
+  for (const m of source.matchAll(/@模板\[([^\]]+)\]/g)) add(makeRef("template", m[1], { source: m[0] }));
+  for (const m of source.matchAll(/@文件\[([^\]]+)\]/g)) add(makeRef("file", m[1], { source: m[0] }));
+  // v0.13.4：`#` 提及。技能/插件只做声明式引用，由 Skills/MCP 清单在运行时解析；
+  // 文件与 @文件 等价，复用同一套工作区路径校验。
+  // 2026-11-03：技能标记统一为 `#技能[...]`，`@技能[...]` 作为兼容别名在同一解析器归一。
+  for (const m of source.matchAll(/[@#]技能\[([^\]]+)\]/g)) add(makeRef("skill", m[1], { source: m[0] }));
+  for (const m of source.matchAll(/#插件\[([^\]]+)\]/g)) add(makeRef("plugin", m[1], { source: m[0] }));
+  for (const m of source.matchAll(/#文件\[([^\]]+)\]/g)) add(makeRef("file", m[1], { source: m[0] }));
+  for (const m of source.matchAll(/&会话\[([^\]]+)\]/g)) add(makeRef("session", m[1], { source: m[0] }));
+  // 创作画布：`@画布[designs/<slug>/project/<boardPath>#element=<id>]`。
+  for (const m of source.matchAll(/@画布\[([^\]]+)\]/g)) add(makeRef("canvas", m[1], { source: m[0] }));
+  // 图表工作台（2026-11-19-001，ADR 0041）：`@图表[charts/<slug>/project/<chartId>.json]`。
+  for (const m of source.matchAll(/@图表\[([^\]]+)\]/g)) add(makeRef("chart", m[1], { source: m[0] }));
+  // @引用裸写法扩展名识别：CAD 开启时把 dxf/dwg 也当文件引用（与 SUPPORTED 同步门控）
+  const ext = new RegExp(`\\.(docx|xlsx|pptx|pdf|csv|json|md|markdown|txt|html|htm${RUNTIME_FLAGS.cadAgent ? "|dxf|dwg" : ""})$`, "i");
+  for (const m of source.matchAll(/(^|[\s(])@([^\s@，。！？\]}]+)/g)) {
+    const target = m[2].replace(/[),;。！？]+$/, "");
+    if (/^(?:文件|知识库|知识库目录|模板|模板目录|技能|插件|会话|画布|图表)\[/.test(target)) continue;
+    if (target.includes("/") || target.includes("\\") || ext.test(target)) add(makeRef("file", target, { source: `@${target}` }));
+  }
+  return out;
+}
+
+function findSessionReferenceFile(target) {
+  const wanted = String(target || "").trim();
+  if (!wanted) return null;
+  const roots = [path.join(PROJECT_DIR, ".规聚会话")];
+  const files = [];
+  const walk = (dir, depth = 0) => {
+    if (depth > 4) return;
+    let entries = [];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) walk(full, depth + 1);
+      else if (entry.isFile() && /\.jsonl$/i.test(entry.name)) files.push(full);
+    }
+  };
+  roots.forEach((root) => walk(root));
+  const byName = files.find((file) => {
+    const name = path.basename(file);
+    return name === wanted + ".jsonl" || name === wanted + ".json" || name.startsWith(wanted);
+  });
+  if (byName) return byName;
+  for (const file of files) {
+    try {
+      const header = JSON.parse(fs.readFileSync(file, "utf8").split(/\r?\n/)[0]);
+      if (String(header?.id || header?.sessionId || "") === wanted) return file;
+    } catch {}
+  }
+  return null;
+}
+
+function sessionMessageText(message) {
+  const content = message?.content;
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  return content.filter((part) => part?.type === "text" || part?.type === "input_text")
+    .map((part) => part.text || part.content || "").join("\n").trim();
+}
+
+function readSessionReference(target) {
+  const file = findSessionReferenceFile(target);
+  if (!file) return null;
+  const chunks = [];
+  try {
+    for (const line of fs.readFileSync(file, "utf8").split(/\r?\n/)) {
+      if (!line.trim()) continue;
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+      if (entry.type !== "message") continue;
+      const role = entry.message?.role;
+      if (role !== "user" && role !== "assistant") continue;
+      const text = sessionMessageText(entry.message);
+      if (text) chunks.push((role === "user" ? "用户" : "助手") + "：" + text);
+    }
+  } catch { return null; }
+  return { file, text: chunks.join("\n\n").slice(0, MAX_READ_CHARS) };
+}
+
+function metadata(file, rootId = null, workspace = getWorkspace()) {
+  const st = fs.statSync(file);
+  // 目录引用只需要用于展示和版本判断，不能把目录交给 readFileSync。
+  // Windows 上对目录调用 readFileSync 会抛出 EISDIR，导致整个 Agent 请求失败。
+  const hash = st.isDirectory()
+    ? null
+    : crypto.createHash("sha1").update(fs.readFileSync(file)).digest("hex");
+  return {
+    path: file,
+    relativePath: rootId ? path.relative(listFileRoots().find((r) => r.id === rootId)?.path || file, file).replace(/\\/g, "/") : path.relative(workspace, file).replace(/\\/g, "/"),
+    rootId,
+    name: path.basename(file),
+    ext: path.extname(file).slice(1).toLowerCase(),
+    mime: mimeFor(file),
+    size: st.size,
+    mtime: st.mtimeMs,
+    hash,
+    version: st.isDirectory() ? `${st.size}:${st.mtimeMs}:directory` : `${st.size}:${st.mtimeMs}:${hash.slice(0, 8)}`,
+  };
+}
+
+function mimeFor(file) {
+  const ext = path.extname(file).slice(1).toLowerCase();
+  return ({
+    docx: "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    xlsx: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    pptx: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    pdf: "application/pdf", csv: "text/csv", json: "application/json",
+    md: "text/markdown", markdown: "text/markdown", txt: "text/plain", html: "text/html", htm: "text/html",
+  })[ext] || "application/octet-stream";
+}
+
+function resolveFile(ref, workspace = getWorkspace()) {
+  if (ref.rootId) return resolveExternalPath(ref.rootId, ref.target);
+  return resolvePath(ref.target, workspace);
+}
+
+/** 画布引用：designs/<slug>/project/(canvas.json | boards/*.board.json)[#element=id]。 */
+function resolveCanvasReference(ref, workspace = getWorkspace()) {
+  const target = String(ref.target || "").replace(/\\/g, "/");
+  const parts = target.split("/").filter(Boolean);
+  if (parts[0] !== "designs" || parts.length < 4 || parts[2] !== "project") {
+    return { ...ref, status: "missing", metadata: null, message: "画布引用必须指向 designs/<slug>/project/ 下的 canvas.json 或 board 文件" };
+  }
+  const slug = parts[1];
+  const boardPath = parts.slice(3).join("/");
+  const file = resolvePath(target, workspace);
+  if (!file || !fs.existsSync(file)) {
+    return { ...ref, status: "missing", metadata: null, message: `画板不存在：${target}` };
+  }
+  const canvasFile = resolvePath(`designs/${slug}/project/canvas.json`, workspace);
+  let index = null;
+  try { index = JSON.parse(fs.readFileSync(canvasFile, "utf8")); } catch { index = null; }
+  if (!index || typeof index !== "object") {
+    return { ...ref, status: "missing", metadata: null, message: `画布索引不存在或无法解析：${slug}` };
+  }
+  const entry = boardPath === "canvas.json" ? null : index.boards?.[boardPath] || null;
+  const name = String(entry?.title || (boardPath === "canvas.json" ? index.title : path.basename(boardPath)) || slug);
+  return {
+    ...ref,
+    status: "resolved",
+    metadata: {
+      path: file,
+      relativePath: target,
+      name,
+      mime: "application/json",
+      canvas: true,
+      canvasSlug: slug,
+      canvasTitle: String(index.title || slug),
+      boardPath,
+      pageId: String(entry?.page || ""),
+      elementId: ref.range?.element ? String(ref.range.element) : "",
+    },
+  };
+}
+
+/** 图表引用（2026-11-19-001，ADR 0041）：charts/<slug>/project/(chart-<id>.json | datasets/<id>.json)。 */
+function resolveChartReference(ref, workspace = getWorkspace()) {
+  const target = String(ref.target || "").replace(/\\/g, "/");
+  const parts = target.split("/").filter(Boolean);
+  if (parts[0] !== "charts" || parts.length < 4 || parts[2] !== "project") {
+    return { ...ref, status: "missing", metadata: null, message: "图表引用必须指向 charts/<slug>/project/ 下的 chart-*.json 或 datasets/*.json 文件" };
+  }
+  const slug = parts[1];
+  const relParts = parts.slice(3).join("/");
+  const file = resolvePath(target, workspace);
+  if (!file || !fs.existsSync(file)) {
+    return { ...ref, status: "missing", metadata: null, message: `图表文件不存在：${target}` };
+  }
+  let payload = null;
+  try { payload = JSON.parse(fs.readFileSync(file, "utf8")); } catch { payload = null; }
+  if (!payload || typeof payload !== "object") {
+    return { ...ref, status: "missing", metadata: null, message: `图表文件无法解析：${target}` };
+  }
+  const isDataset = /^datasets\//i.test(relParts);
+  return {
+    ...ref,
+    status: "resolved",
+    metadata: {
+      path: file,
+      relativePath: target,
+      name: String(payload.title || path.basename(relParts)),
+      mime: "application/json",
+      chart: true,
+      chartSlug: slug,
+      chartId: isDataset ? "" : String(payload.id || ""),
+      datasetId: isDataset ? String(payload.id || "") : String(payload.data?.datasetId || ""),
+      internalPath: relParts,
+    },
+  };
+}
+
+export function resolveReference(input, workspace = getWorkspace()) {
+  const ref = typeof input === "string" ? makeRef("file", input) : { ...input };
+  ref.id ||= idFor(ref);
+  if (["knowledge", "knowledge_dir", "template", "template_dir", "skill", "plugin"].includes(ref.kind)) {
+    return { ...ref, status: "deferred", message: "由知识库/模板/Skills/插件清单解析", metadata: null };
+  }
+  if (ref.kind === "session") {
+    const session = readSessionReference(ref.target);
+    return session
+      ? { ...ref, status: "resolved", metadata: { path: session.file, name: path.basename(session.file), mime: "text/plain", sessionId: ref.target } }
+      : { ...ref, status: "missing", metadata: null, message: "未找到该历史会话" };
+  }
+  if (ref.kind === "canvas") return resolveCanvasReference(ref, workspace);
+  if (ref.kind === "chart") return resolveChartReference(ref, workspace);
+  const file = resolveFile(ref, workspace);
+  if (!file) return { ...ref, status: "missing", metadata: null, message: "文件不存在或不在已登记目录内" };
+  const stat = fs.statSync(file);
+  if (stat.isDirectory()) {
+    const files = [];
+    const walk = (dir, depth = 0) => {
+      if (depth > 3 || files.length >= 100) return;
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (entry.name.startsWith(".")) continue;
+        const p = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(p, depth + 1);
+        else if (supportedDocumentExts().has(path.extname(entry.name).slice(1).toLowerCase())) files.push(metadata(p, ref.rootId || null, workspace));
+      }
+    };
+    walk(file);
+    return { ...ref, status: "resolved", metadata: { ...metadata(file, ref.rootId || null, workspace), isDirectory: true, files } };
+  }
+  return { ...ref, status: supportedDocumentExts().has(path.extname(file).slice(1).toLowerCase()) ? "resolved" : "unsupported", metadata: metadata(file, ref.rootId || null, workspace) };
+}
+
+export function resolveReferences(references = [], text = "", workspace = getWorkspace()) {
+  const refs = [...(Array.isArray(references) ? references : []), ...parseReferences(text)];
+  const seen = new Set();
+  return refs.map((r) => ({ ...r, id: r.id || idFor(r) })).filter((r) => {
+    const key = `${r.kind}:${r.target}:${r.rootId || ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  }).map((ref) => resolveReference(ref, workspace));
+}
+
+async function extractDocx(file) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(file));
+  const xml = await zip.file("word/document.xml")?.async("string");
+  if (!xml) return "";
+  return [...xml.matchAll(/<w:p\b[^>]*>[\s\S]*?<\/w:p>/g)].map((m) => [...m[0].matchAll(/<w:t[^>]*>([\s\S]*?)<\/w:t>/g)].map((x) => x[1]).join("").trim()).filter(Boolean).join("\n");
+}
+
+async function extractPptx(file) {
+  const zip = await JSZip.loadAsync(fs.readFileSync(file));
+  const slides = Object.keys(zip.files).filter((n) => /^ppt\/slides\/slide\d+\.xml$/.test(n)).sort();
+  const chunks = [];
+  for (const name of slides) {
+    const xml = await zip.file(name).async("string");
+    const text = [...xml.matchAll(/<a:t[^>]*>([\s\S]*?)<\/a:t>/g)].map((m) => m[1]).join("").trim();
+    if (text) chunks.push(`${name.match(/slide(\d+)/)?.[1] || "?"}. ${text}`);
+  }
+  return chunks.join("\n");
+}
+
+async function extractPdf(file) {
+  try {
+    const { stdout } = await execFileAsync("pdftotext", [file, "-"], { timeout: 30000, maxBuffer: 10 * 1024 * 1024 });
+    return stdout;
+  } catch {
+    if (process.env.OAW_ENABLE_OCR !== "1") return "[PDF 文本抽取工具不可用；可安装 poppler，或设置 OAW_ENABLE_OCR=1 启用可选 OCR。]";
+    const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "oaw-pdf-"));
+    try {
+      const prefix = path.join(tmp, "page");
+      await execFileAsync("pdftoppm", ["-f", "1", "-l", "5", "-png", "-r", "150", file, prefix], { timeout: 60000 });
+      const pages = fs.readdirSync(tmp).filter((name) => name.endsWith(".png")).sort();
+      const chunks = [];
+      for (const page of pages) {
+        try {
+          const { stdout } = await execFileAsync("tesseract", [path.join(tmp, page), "stdout", "-l", process.env.OAW_OCR_LANG || "eng"], { timeout: 60000, maxBuffer: 5 * 1024 * 1024 });
+          if (stdout.trim()) chunks.push(`${page}:\n${stdout.trim()}`);
+        } catch {}
+      }
+      return chunks.join("\n\n") || "[OCR 未识别到文本；请检查 tesseract 与语言包。]";
+    } catch {
+      return "[OCR 依赖不可用；请安装 pdftoppm 与 tesseract，或使用 PDF 文本层。]";
+    } finally {
+      try { fs.rmSync(tmp, { recursive: true, force: true }); } catch {}
+    }
+  }
+}
+
+async function extractFile(file, range = null) {
+  const ext = path.extname(file).slice(1).toLowerCase();
+  if (["md", "markdown", "txt", "html", "htm", "csv", "json"].includes(ext)) return fs.readFileSync(file, "utf8");
+  if (ext === "dxf" || ext === "dwg") {
+    // CAD 摘要（AC3）：结构化解析 → 图层/实体/文字/范围文本，走统一 documentRead 缓存。
+    // 降级（DWG 无转换器/损坏文件）以可读错误文本返回，不向 agent 抛原始堆栈（AC2）。
+    if (!RUNTIME_FLAGS.cadAgent) return "[CAD 读取未开启（OAW_CAD_AGENT=1）]";
+    try {
+      const { readCadDocument, summarizeCad } = await import("./CAD解析.mjs");
+      const cad = await readCadDocument(file);
+      return summarizeCad(cad, path.basename(file));
+    } catch (e) {
+      return `[CAD 读取失败：${e?.message || e}]`;
+    }
+  }
+  if (ext === "docx") return extractDocx(file);
+  if (ext === "pptx") return extractPptx(file);
+  if (ext === "xlsx") {
+    const wb = XLSX.readFile(file, { cellText: true, cellDates: true });
+    const names = range?.sheet && wb.SheetNames.includes(range.sheet) ? [range.sheet] : wb.SheetNames;
+    return names.map((name) => {
+      const sheet = wb.Sheets[name];
+      if (range?.cell && name === range.sheet) {
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+        const decoded = XLSX.utils.decode_range(range.cell);
+        const selected = rows.slice(decoded.s.r, decoded.e.r + 1).map((row) => row.slice(decoded.s.c, decoded.e.c + 1).join("\t"));
+        return `## ${name}!${range.cell}\n${selected.join("\n")}`;
+      }
+      return `## ${name}\n${XLSX.utils.sheet_to_csv(sheet)}`;
+    }).join("\n\n");
+  }
+  if (ext === "pdf") return extractPdf(file);
+  return "";
+}
+
+function applyRange(text, range = {}) {
+  let out = String(text || "");
+  if (range?.slide || range?.page || range?.paragraph) {
+    const n = Number(range.slide || range.page || range.paragraph);
+    const end = Number(range.end || n);
+    const lines = out.split(/\r?\n/);
+    if (range.slide) out = lines.filter((line) => { const m = line.match(/^(\d+)\./); return m && Number(m[1]) >= n && Number(m[1]) <= end; }).join("\n");
+    else out = lines.slice(Math.max(0, n - 1), Math.max(0, end)).join("\n");
+  }
+  if (range?.startLine || range?.endLine) {
+    const lines = out.split(/\r?\n/);
+    const start = Math.max(1, Number(range.startLine || 1));
+    const end = Math.min(lines.length, Number(range.endLine || lines.length));
+    out = lines.slice(start - 1, end).join("\n");
+  }
+  return out;
+}
+
+export async function readReference(input, query = "", range = null, workspace = getWorkspace()) {
+  const resolved = resolveReference(input, workspace);
+  if (resolved.kind === "session") {
+    const session = readSessionReference(resolved.target);
+    if (!session) return { ...resolved, status: "missing", message: "未找到该历史会话" };
+    const q = String(query || "").trim().toLowerCase();
+    const text = q ? session.text.split(/\r?\n/).filter((line) => line.toLowerCase().includes(q)).join("\n") : session.text;
+    return { ...resolved, status: "resolved", text: text.slice(0, MAX_READ_CHARS), truncated: text.length > MAX_READ_CHARS };
+  }
+  if (resolved.kind === "canvas") {
+    const cvs = await import("./创作画布.mjs");
+    const meta = resolved.metadata || {};
+    let text = "";
+    if (meta.boardPath === "canvas.json") {
+      const read = cvs.readCanvas(workspace, meta.canvasSlug);
+      const lines = read.boards.map((board) => `- ${board.path}（${board.title || board.path} · ${board.w}×${board.h}${board.page ? ` · 页 ${board.page}` : ""}${board.kind === "html" ? " · 兼容板只读" : ""}）`);
+      text = `【画布引用】${read.canvas.title || meta.canvasSlug}（slug=${meta.canvasSlug}，${read.canvas.kind || "board"}，rev ${read.canvas.rev}）\n板（${read.boards.length}）：\n${lines.join("\n") || "（空）"}\n\n修改约束：新增/修改画板请用 canvas_write，并显式传 slug=${meta.canvasSlug}；不要把整张画布当成单个板覆盖。`;
+    } else {
+      const read = cvs.readBoard(workspace, meta.canvasSlug, meta.boardPath);
+      if (read.board?.kind === "html") {
+        text = `【画布引用】${meta.canvasTitle} / ${meta.name}（兼容板只读，slug=${meta.canvasSlug}，board=${meta.boardPath}）\n该板是 .dc.html 兼容板，产品内不编辑内部对象、不写回原文件。`;
+      } else if (read.board?.kind === "svg") {
+        text = `【画布引用】${meta.canvasTitle} / ${meta.name}（SVG 矢量板只读，slug=${meta.canvasSlug}，board=${meta.boardPath}）`;
+      } else {
+        const board = read.board || {};
+        const elements = Array.isArray(board.elements) ? board.elements : [];
+        const wanted = String(meta.elementId || "");
+        const selected = wanted ? elements.filter((element) => String(element.id) === wanted) : [];
+        const summary = elements.slice(0, 60).map((element) => {
+          const label = element.type === "text" ? String(element.text || "").slice(0, 40) : element.type;
+          return `- ${element.id}（${element.type}${label ? ` · ${label}` : ""}）`;
+        });
+        text = `【画布引用】${meta.canvasTitle} / ${meta.name}（slug=${meta.canvasSlug}，board=${meta.boardPath}，页=${meta.pageId || "未指定"}，板 rev ${read.rev}）\n`
+          + `板尺寸：${board.w || "?"}×${board.h || "?"}；元素 ${elements.length} 个。\n`
+          + (wanted
+            ? `选中元素 ${wanted}：\n${JSON.stringify(selected[0] || null, null, 2)}\n${selected.length ? "" : "（该元素已不存在；请先 canvas_read 确认当前元素 id）\n"}`
+            : `元素摘要：\n${summary.join("\n") || "（空板）"}\n`)
+          + `\n修改约束：只改引用范围（${wanted ? `元素 ${wanted}` : `画板 ${meta.boardPath}`}）；使用 canvas_write patch_board 时传 slug=${meta.canvasSlug}、board=${meta.boardPath}，并保留未涉及的元素。`;
+      }
+    }
+    return {
+      ...resolved,
+      status: "resolved",
+      metadata: { ...meta, parser: "canvas", readAt: new Date().toISOString() },
+      text: text.slice(0, 4000),
+      truncated: text.length > 4000,
+    };
+  }
+  if (resolved.kind === "chart") {
+    const charts = await import("./图表工作台.mjs");
+    const meta = resolved.metadata || {};
+    let text = "";
+    try {
+      if (meta.datasetId && !meta.chartId) {
+        const read = charts.readDataset(workspace, meta.chartSlug, meta.datasetId);
+        const d = read.dataset || {};
+        const preview = (d.rows || []).slice(0, 20).map((row) => row.join(" | ")).join("\n");
+        text = `【数据表引用】${d.title || meta.datasetId}（slug=${meta.chartSlug}，datasetId=${meta.datasetId}，${(d.fields || []).length} 列 × ${(d.rows || []).length} 行${(d.rows || []).length > 20 ? "，仅预览前 20 行" : ""}）\n`
+          + `字段：${(d.fields || []).map((f) => `${f.name}:${f.type}`).join(", ")}\n${preview || "（空表）"}`
+          + `\n\n修改约束：修改数据请用 data_write（全量写，slug=${meta.chartSlug}，id=${meta.datasetId}），行数/行宽/类型必须与 fields 一致；删除用 data_delete（需审批）。`;
+      } else {
+        const read = charts.readChart(workspace, meta.chartSlug, meta.chartId);
+        const chart = read.chart || {};
+        let dataDescription = "";
+        if (chart.data?.kind === "dataset") {
+          try {
+            const ds = charts.readDataset(workspace, meta.chartSlug, chart.data.datasetId).dataset || {};
+            dataDescription = `绑定数据表 ${chart.data.datasetId}「${ds.title}」（${(ds.fields || []).length} 列 × ${(ds.rows || []).length} 行）`;
+          } catch {
+            dataDescription = `绑定数据表 ${chart.data.datasetId}（已删除，渲染将标记 missing）`;
+          }
+        } else {
+          dataDescription = `内联数据（${JSON.stringify(chart.data?.inline ?? null).length} 字节）`;
+        }
+        text = `【图表引用】${chart.title || meta.chartId}（slug=${meta.chartSlug}，${meta.chartId}）\n`
+          + `option：\n${JSON.stringify(chart.option ?? {}, null, 2).slice(0, 3000)}\n数据：${dataDescription}${chart.note ? `\n备注：${chart.note}` : ""}`
+          + `\n\n修改约束：改 option/标题用 chart_write（slug=${meta.chartSlug}，id=${meta.chartId}）；只改数据用 chart_set_data；改数据表内容用 data_write。绑定数据表的图表 series 不得直连 data、不得自带 option.dataset。`;
+      }
+    } catch (e) {
+      return { ...resolved, status: "missing", message: `图表引用读取失败：${e?.message || e}` };
+    }
+    return {
+      ...resolved,
+      status: "resolved",
+      metadata: { ...meta, parser: "chart", readAt: new Date().toISOString() },
+      text: text.slice(0, 4000),
+      truncated: text.length > 4000,
+    };
+  }
+  if (resolved.kind === "knowledge") {    const kb = await import("./kb.mjs");
+    await kb.scan();
+    const [relPath, rootName] = String(resolved.target).split("@").map((s) => s.trim());
+    const rootIdx = rootName ? kb.status().roots.findIndex((r) => r.name === rootName) : null;
+    const doc = kb.getDoc(relPath, rootIdx >= 0 ? rootIdx : null);
+    if (!doc) return { ...resolved, status: "missing", message: `未找到知识库文档 ${resolved.target}` };
+    const text = applyRange(`# ${doc.title}\n\n${doc.content}`, range);
+    return { ...resolved, status: "resolved", metadata: { relativePath: relPath, rootName, mime: "text/markdown" }, text: text.slice(0, MAX_READ_CHARS), truncated: text.length > MAX_READ_CHARS };
+  }
+  if (resolved.kind === "knowledge_dir") {
+    const kb = await import("./kb.mjs");
+    await kb.scan();
+    const [relPath, rootName] = String(resolved.target).split("@").map((s) => s.trim());
+    const rootIdx = rootName ? kb.status().roots.findIndex((r) => r.name === rootName) : null;
+    const tree = kb.getTreeLevel(rootIdx >= 0 ? rootIdx : 0, relPath || "");
+    const text = [...(tree?.dirs || []).map((d) => `[目录] ${d.name || d.path}`), ...(tree?.files || []).map((f) => `[文件] ${f.title || f.name || f.relPath}`)].join("\n");
+    return { ...resolved, status: "resolved", metadata: { relativePath: relPath, rootName, mime: "text/plain", isDirectory: true }, text: text || "（目录为空）" };
+  }
+  if (resolved.kind === "template") {
+    const tpl = await import("./tpl.mjs");
+    const templatePath = tpl.resolveTemplatePath(resolved.target);
+    const doc = tpl.getTemplateContent(resolved.target);
+    if (!doc || !templatePath) return { ...resolved, status: "missing", message: `未找到模板 ${resolved.target}` };
+    // 文本模板由 tpl 直接读取；Office/PDF 模板需要走统一抽取器，
+    // 否则 context_read 只能返回文件元数据，Agent 无法真正参考模板结构。
+    const rawText = doc.content ?? await extractFile(templatePath, range);
+    const text = applyRange(rawText, range);
+    return { ...resolved, status: "resolved", metadata: { relativePath: resolved.target, mime: mimeFor(templatePath), parser: path.extname(templatePath).slice(1).toLowerCase() }, text: text.slice(0, MAX_READ_CHARS), truncated: text.length > MAX_READ_CHARS };
+  }
+  if (resolved.kind === "template_dir") return { ...resolved, status: "deferred", message: "模板目录引用请先选择具体模板文件" };
+  if (resolved.status !== "resolved" || resolved.metadata?.isDirectory) return { ...resolved, text: resolved.message || "目录引用需要逐个读取文件" };
+  const extractionRange = range || resolved.range || null;
+  const cacheKey = cacheKeyFor(resolved.metadata.path, resolved.metadata.version, extractionRange);
+  let text = readCachedDocument(cacheKey);
+  const cacheHit = text !== null;
+  if (!cacheHit) {
+    text = await extractFile(resolved.metadata.path, extractionRange);
+    cacheDocument(cacheKey, text);
+  }
+  text = applyRange(text, extractionRange);
+  const q = String(query || "").trim();
+  const result = q ? text.split(/\r?\n/).filter((line) => line.toLowerCase().includes(q.toLowerCase())).join("\n") : text;
+  return {
+    ...resolved,
+    metadata: { ...resolved.metadata, parser: path.extname(resolved.metadata.path).slice(1).toLowerCase(), cacheHit, readAt: new Date().toISOString() },
+    text: result.slice(0, MAX_READ_CHARS),
+    truncated: result.length > MAX_READ_CHARS,
+  };
+}
+
+export function contextSummary(resolved = []) {
+  return resolved.map((r) => `- ${r.id}: ${r.kind} ${r.target} → ${r.status}${r.metadata?.relativePath ? ` (${r.metadata.relativePath})` : ""}`).join("\n");
+}

@@ -1,0 +1,134 @@
+import React, { useEffect, useRef, useState } from "react";
+import Spreadsheet from "x-data-spreadsheet";
+import "x-data-spreadsheet/dist/xspreadsheet.css";
+import { saveCells } from "../api.js";
+import Icon from "./Icon.jsx";
+
+function indexToCol(i) { let s = ""; while (i > 0) { const r = (i - 1) % 26; s = String.fromCharCode(65 + r) + s; i = Math.floor((i - r) / 26); } return s; }
+
+export default function ExcelGrid({ name, sheets, grids, officeHtmlUrl = "", onDirtyChange }) {
+  const hostRef = useRef(null);
+  const [spread, setSpread] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [dirty, setDirty] = useState(false);
+  const [msg, setMsg] = useState("");
+  // 网格只承载“单元格值”；公式/样式/合并单元格由 OfficeCLI HTML 只读预览补足。
+  const [officeMode, setOfficeMode] = useState(false);
+  const sheetNames = Array.isArray(sheets) ? sheets : [];
+  const hasSheets = sheetNames.length > 0;
+  // 保存时记录每个 sheet 的初始数据
+  const initialRef = useRef({});
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+
+  useEffect(() => {
+    if (!hostRef.current || !hasSheets) return undefined;
+    const s = new Spreadsheet(hostRef.current, {
+      showToolbar: true,
+      showGrid: true,
+      view: { height: () => Math.max(200, hostRef.current?.clientHeight - 40) },
+    });
+    setSpread(s);
+    if (typeof s.change === "function") s.change(() => setDirty(true));
+    return () => { if (typeof s.destroy === "function") try { s.destroy(); } catch {} };
+  }, [hasSheets]);
+
+  // 一次加载所有 sheets（带 name），x-spreadsheet 底部标签栏可切换
+  useEffect(() => {
+    if (!spread || !hasSheets) return;
+    const allSheets = sheetNames.map((s) => ({
+      name: s,
+      rows: grids?.[s]?.rows || grids?.[s] || {},
+    }));
+    initialRef.current = {};
+    for (const s of sheetNames) {
+      initialRef.current[s] = JSON.parse(JSON.stringify(grids?.[s]?.rows || grids?.[s] || {}));
+    }
+    spread.loadData(allSheets);
+    setDirty(false);
+  }, [spread, hasSheets, sheetNames, grids]);
+
+  // sheets 为空（文件读取失败）时显示错误。放在 hooks 之后，避免文件从加载中
+  // 变为可读时触发 React 的 hooks 顺序错误。
+  if (!hasSheets) {
+    return (
+      <div className="excel-wrap">
+        <div className="excel-toolbar">
+          <span className="badge">可编辑</span>
+        </div>
+        <div className="excel-empty">
+          <div><Icon name="warning" size={14} /> 无法读取工作表</div>
+          <div className="hint">文件可能已损坏、被占用（Excel 打开中），或格式不受支持</div>
+        </div>
+      </div>
+    );
+  }
+
+  const handleSave = async () => {
+    if (!spread) return;
+    // getData 返回所有 sheet 的数据数组
+    const allData = spread.getData(); // [{ name, rows }]
+    const changedBySheet = {};
+    for (const sd of allData) {
+      const sname = sd.name;
+      const current = sd.rows || {};
+      const initial = initialRef.current[sname] || {};
+      const cells = [];
+      const allKeys = new Set([...Object.keys(current), ...Object.keys(initial)]);
+      for (const ri of allKeys) {
+        const cur = current[ri]?.cells || {};
+        const ini = initial[ri]?.cells || {};
+        for (const ci of new Set([...Object.keys(cur), ...Object.keys(ini)])) {
+          const cv = cur[ci]?.text ?? "";
+          const iv = ini[ci]?.text ?? "";
+          if (cv !== iv) cells.push({ ref: indexToCol(Number(ci)) + ri, value: cv });
+        }
+      }
+      if (cells.length) changedBySheet[sname] = cells;
+    }
+    const total = Object.values(changedBySheet).reduce((a, b) => a + b.length, 0);
+    if (!total) { setMsg("no changes"); return; }
+    setSaving(true);
+    try {
+      for (const [sname, cells] of Object.entries(changedBySheet)) {
+        await saveCells(name, sname, cells);
+      }
+      setMsg(`saved ${total} cells`);
+      setDirty(false);
+      // 更新初始数据
+      for (const sd of allData) {
+        initialRef.current[sd.name] = JSON.parse(JSON.stringify(sd.rows || {}));
+      }
+    } catch (e) { setMsg("save failed: " + e.message); }
+    setSaving(false);
+    setTimeout(() => setMsg(""), 2500);
+  };
+
+  return (
+    <div className="excel-wrap">
+      <div className="excel-toolbar">
+        <span className="badge">工作簿 · {sheets.length} 个工作表</span>
+        <span className="badge">仅显示单元格值</span>
+        <span className="excel-sheet-hint">公式、样式、合并单元格不在网格预览中；底部标签栏可切换工作表</span>
+        {officeHtmlUrl && (
+          <button className="btn-sm" onClick={() => setOfficeMode((value) => !value)} title={officeMode ? "切回可编辑的值网格" : "OfficeCLI 高保真只读预览（查看公式/样式/合并单元格）"}>
+            {officeMode ? "表格编辑" : "高保真预览"}
+          </button>
+        )}
+        {!officeMode && (
+          <button className="btn primary" onClick={handleSave} disabled={saving} title="只保存修改过的单元格值；编辑公式单元格会把公式替换为文本">
+            {saving ? "saving..." : "save changes"}
+          </button>
+        )}
+        {msg && <span className="save-msg">{msg}</span>}
+      </div>
+      <div ref={hostRef} className="excel-host" style={officeMode ? { display: "none" } : undefined} />
+      {officeMode && officeHtmlUrl && (
+        <div className="excel-office">
+          <iframe title={`${name} 高保真预览`} src={officeHtmlUrl} className="excel-office-frame" />
+          <div className="excel-office-hint">OfficeCLI 高保真只读渲染；如显示异常可切回表格编辑。</div>
+        </div>
+      )}
+    </div>
+  );
+}

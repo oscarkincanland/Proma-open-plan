@@ -1,0 +1,641 @@
+#!/usr/bin/env node
+/**
+ * 内置浏览器测试。
+ * 默认运行离线部分（工具契约/接入点/错误处理）；
+ * 加 --live 参数（或设置 OAW_BROWSER_LIVE=1）时追加真实浏览器链路测试
+ * （启动 Edge → Bing 搜索 → 读取结果 → 关闭）。
+ *
+ * 用法: node scripts/内置浏览器测试.mjs [--live]
+ */
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+// 测试使用独立 profile 目录：保证“未启动”断言确定性，也避免影响用户正在使用的浏览器
+process.env.OAW_BROWSER_PROFILE = path.join(os.tmpdir(), `oaw-browser-test-${Date.now().toString(36)}`);
+const {
+  browserAct,
+  browserClick,
+  browserClose,
+  browserExtract,
+  browserOpen,
+  browserScroll,
+  browserSelectOption,
+  browserSessionKey,
+  browserSnapshot,
+  browserType,
+  browserUserInput,
+  browserWaitFor,
+  classifyNavigation,
+  getBrowserSession,
+  mergeBrowserSites,
+  upsertBrowserAction,
+  shutdownBrowsers,
+} = await import("../server/内置浏览器.mjs");
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, "..");
+const LIVE = process.argv.includes("--live") || process.env.OAW_BROWSER_LIVE === "1";
+let failed = 0;
+function ok(msg) { console.log(`  ✓ ${msg}`); }
+function fail(msg) { console.error(`  ✗ ${msg}`); failed = 1; }
+async function test(name, fn) {
+  try { await fn(); ok(name); } catch (e) { fail(`${name}: ${e.message}`); }
+}
+
+console.log("\n▶ 离线契约");
+
+await test("会话 key 生成稳定，且兼容工具上下文的复合 agentKey", () => {
+  assert.equal(browserSessionKey("c1", "t1"), "c1::t1");
+  assert.equal(browserSessionKey("c1", ""), "c1::");
+  // Agent 工具传入的 clientId 实为 client::thread；必须归一化到与前端面板同一个键
+  assert.equal(browserSessionKey("c1::t1", "t1"), "c1::t1");
+  assert.equal(browserSessionKey("client-abc::thread-9", "thread-9"), "client-abc::thread-9");
+});
+
+await test("未启动时会话为空 / 快照与点击给出可解释错误", async () => {
+  const key = browserSessionKey("offline", "none");
+  assert.equal(getBrowserSession(key), null);
+  await assert.rejects(() => browserSnapshot(key), /尚未启动/);
+  await assert.rejects(() => browserClick(key, "e1"), /尚未启动/);
+  const closed = await browserClose(key);
+  assert.equal(closed.closed, false);
+});
+
+await test("无效 URL 被拒绝（不启动浏览器）", async () => {
+  const key = browserSessionKey("offline", "badurl");
+  await assert.rejects(() => browserOpen(key, "file:///etc/passwd"), /无效的 URL/);
+  await assert.rejects(() => browserOpen(key, ""), /URL 不能为空/);
+});
+
+await test("点击非法编号被拒绝", async () => {
+  const key = browserSessionKey("offline", "badref");
+  // 直接构造一个假会话条目，验证编号校验（不会真正连浏览器）
+  const { getBrowserSession: get } = await import("../server/内置浏览器.mjs");
+  assert.equal(get(key), null);
+  await assert.rejects(() => browserType(key, "javascript:1", "x"), /尚未启动/);
+});
+
+console.log("\n▶ 沙箱与 CDP 归属（P0）");
+
+await test("默认开启沙箱：--no-sandbox 仅在显式开关函数中出现", () => {
+  const src = fs.readFileSync(path.join(ROOT, "server", "内置浏览器.mjs"), "utf8");
+  assert.equal((src.match(/"--no-sandbox"/g) || []).length, 1, "--no-sandbox 只应出现在 sandboxArgs 中，不得无条件启用");
+  assert.match(src, /OAW_BROWSER_NO_SANDBOX/, "应有显式的沙箱降级开关");
+  assert.match(src, /--remote-debugging-address=127\.0\.0\.1/, "CDP 应只绑定回环地址");
+  assert.match(src, /DevToolsActivePort/, "复用前应校验 CDP 归属");
+  assert.match(src, /hasLiveProfileProcess/, "清锁前应确认没有存活实例");
+});
+
+await test("CDP 归属校验：标记/进程双重证明，缺失标记不误判", async () => {
+  const { verifyCdpOwnership } = await import("../server/内置浏览器.mjs");
+  const { spawn } = await import("node:child_process");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "oaw-cdp-own-"));
+  const child = spawn(process.execPath, ["-e", "setTimeout(()=>{},8000)", dir], { stdio: "ignore" });
+  try {
+    // 1) 无标记 + 无 pid → 无法证明归属，拒绝
+    let verdict = await verifyCdpOwnership({ port: 9333, pid: 0, profileDir: dir });
+    assert.equal(verdict.ok, false, "既无标记也无进程时应拒绝");
+    assert.match(verdict.reason, /DevToolsActivePort|归属/);
+    // 2) 标记存在但端口不一致 → 拒绝
+    fs.writeFileSync(path.join(dir, "DevToolsActivePort"), "9444\n/devtools/browser/abc");
+    verdict = await verifyCdpOwnership({ port: 9333, pid: 0, profileDir: dir });
+    assert.equal(verdict.ok, false, "端口不一致时应拒绝");
+    assert.match(verdict.reason, /不一致/);
+    // 3) 标记一致 → 通过
+    verdict = await verifyCdpOwnership({ port: 9444, pid: 0, profileDir: dir });
+    assert.equal(verdict.ok, true, "标记端口一致时应通过");
+    // 4) pid 不存在 → 拒绝
+    verdict = await verifyCdpOwnership({ port: 9444, pid: 999999, profileDir: dir });
+    assert.equal(verdict.ok, false, "pid 已不存在时应拒绝");
+    assert.match(verdict.reason, /已不存在|不属于/);
+    // 5) 关键回归：真实平台可能不生成 DevToolsActivePort，此时靠「进程存活 + 命令行含本 profile」证明归属
+    fs.rmSync(path.join(dir, "DevToolsActivePort"), { force: true });
+    verdict = await verifyCdpOwnership({ port: 9444, pid: child.pid, profileDir: dir });
+    assert.equal(verdict.ok, true, "无标记但有本 profile 的进程时应通过（否则内置浏览器会打不开）");
+  } finally {
+    try { child.kill("SIGKILL"); } catch {}
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+await test("启动期不再因缺少 DevToolsActivePort 而拒绝启动", () => {
+  const src = fs.readFileSync(path.join(ROOT, "server", "内置浏览器.mjs"), "utf8");
+  assert.match(src, /if \(!marker\) console\.warn\("\[browser\] profile 内未生成 DevToolsActivePort/, "缺少标记时应只告警");
+  assert.doesNotMatch(src, /if \(!marker \|\| Number\(marker\.port\) !== Number\(this\.port\)\)/, "不得再因缺少标记而抛错");
+  assert.match(src, /if \(marker && Number\(marker\.port\) !== Number\(this\.port\)\)/, "标记存在且不一致时才拒绝");
+});
+
+console.log("\n▶ 用户接管仲裁与恢复（P1）");
+
+await test("归属逻辑：用户 lease 生效/过期/Agent 放行", async () => {
+  const { normalizeBrowserOwnership, browserAgentWriteBlocked } = await import("../server/内置浏览器.mjs");
+  const now = 1_000_000;
+  assert.equal(normalizeBrowserOwnership({ owner: "agent" }, now).owner, "agent");
+  const user = { owner: "user", leaseExpiresAt: now + 30_000, reason: "用户正在操作（click）" };
+  const blocked = browserAgentWriteBlocked(user, now);
+  assert.ok(blocked, "用户接管期间 Agent 写操作应被阻塞");
+  assert.equal(blocked.code, "BROWSER_USER_TAKEOVER");
+  assert.match(blocked.message, /用户操作|暂停/);
+  assert.ok(blocked.retryAfterMs > 0 && blocked.retryAfterMs <= 30_000);
+  // lease 过期 → 自动回到 Agent，避免用户断线后永久锁死
+  const expired = normalizeBrowserOwnership({ owner: "user", leaseExpiresAt: now - 1 }, now);
+  assert.equal(expired.owner, "agent");
+  assert.equal(expired.expiredFrom, "user");
+  assert.equal(browserAgentWriteBlocked({ owner: "user", leaseExpiresAt: now - 1 }, now), null, "过期后应放行");
+});
+
+await test("只有真正的交互才算接管（resize/tabs 列表不算）", async () => {
+  const { BROWSER_USER_ACTION_SET } = await import("../server/内置浏览器.mjs");
+  for (const action of ["click", "pointer", "type", "key", "scroll", "wheel", "navigate", "back", "reload", "tab_switch"]) {
+    assert.ok(BROWSER_USER_ACTION_SET.has(action), `${action} 应算作用户接管`);
+  }
+  for (const action of ["resize", "tabs", "release", "takeover"]) {
+    assert.ok(!BROWSER_USER_ACTION_SET.has(action), `${action} 不应算作用户接管输入`);
+  }
+});
+
+await test("服务端持有归属，Agent 写操作被守卫拦截", () => {
+  const src = fs.readFileSync(path.join(ROOT, "server", "内置浏览器.mjs"), "utf8");
+  assert.match(src, /this\.ownership = \{ owner: "agent"/, "会话应持有归属状态");
+  assert.match(src, /USER_TAKEOVER_LEASE_MS/, "应有短期 lease");
+  assert.match(src, /releaseToAgent\(/, "应支持交还 Agent");
+  assert.match(src, /assertAgentWrite\(/, "应提供 Agent 写操作守卫");
+  // 写操作必须带守卫；只读操作不得被阻断
+  for (const fn of ["browserOpen", "browserClick", "browserType", "browserPress", "browserScroll", "browserBack"]) {
+    const body = src.slice(src.indexOf(`export async function ${fn}(`), src.indexOf(`export async function ${fn}(`) + 420);
+    assert.match(body, /assertAgentWrite\(/, `${fn} 缺少写操作守卫`);
+  }
+  assert.doesNotMatch(src.slice(src.indexOf("export async function browserSnapshot("), src.indexOf("export async function browserSnapshot(") + 200), /assertAgentWrite/, "只读 snapshot 不应被拦截");
+  assert.match(src, /ownership: this\.ownershipView\(\)/, "stateView 应暴露归属状态");
+  // 用户输入入口支持 release/takeover，且不再对 resize 计接管
+  assert.match(src, /action === "release"\) return session\.releaseToAgent/, "应支持 release");
+  assert.match(src, /action === "takeover"\) return session\.takeover/, "应支持 takeover");
+  assert.doesNotMatch(src, /browserUserInput[\s\S]{0,220}?session\.lastUserInputAt = Date\.now\(\);\s*\n\s*const action/, "不应无条件刷新用户输入时间");
+});
+
+await test("前端接管按钮走服务端，且只在可恢复错误时重置浏览器", () => {
+  const panel = fs.readFileSync(path.join(ROOT, "client", "src", "components", "内置浏览器面板.jsx"), "utf8");
+  assert.doesNotMatch(panel, /setTakeover\(/, "不应再只改本地布尔值");
+  assert.match(panel, /const userOwns = ownership\.owner === "user"/, "应由服务端归属驱动 UI");
+  assert.match(panel, /action, reason: action === "release"/, "接管/交回应调用服务端");
+  assert.match(panel, /isRecoverableBrowserError\(error\)/, "只应对可识别的启动异常做重置");
+  assert.match(panel, /BROWSER_LAUNCH_FAILED/, "应识别启动失败错误码");
+  assert.match(panel, /RECOVERABLE_BROWSER_PATTERN/, "应识别 profile 锁/退出码 21 文案");
+});
+
+await test("Agent 侧错误文案解释接管原因", () => {
+  const agent = fs.readFileSync(path.join(ROOT, "server", "agent.mjs"), "utf8");
+  assert.match(agent, /BROWSER_USER_TAKEOVER/, "Agent 工具应识别接管错误码");
+  assert.match(agent, /请等待用户点击「交还 Agent」/, "应给出可执行指引");
+  assert.match(agent, /接管仲裁/, "系统提示应说明接管仲裁");
+});
+
+console.log("\n▶ 帧流与恢复（P1）");
+
+await test("订阅者计数随订阅/取消变化", async () => {
+  const { browserSubscriberCount, subscribeBrowser } = await import("../server/内置浏览器.mjs");
+  const key = browserSessionKey("frames", "count");
+  assert.equal(browserSubscriberCount(key), 0, "初始应为 0");
+  const off = subscribeBrowser(key, () => {});
+  assert.equal(browserSubscriberCount(key), 1, "订阅后应为 1");
+  off();
+  assert.equal(browserSubscriberCount(key), 0, "取消后应回到 0");
+});
+
+await test("推流不再被静默吞掉，且有恢复与兜底机制", () => {
+  const src = fs.readFileSync(path.join(ROOT, "server", "内置浏览器.mjs"), "utf8");
+  // 推流启动失败必须记录并进入兜底，而不是 .catch(()=>{})
+  assert.match(src, /async startScreencast\(\)/, "应有独立的推流启动方法");
+  assert.match(src, /this\.screencastError/, "推流失败原因应被记录");
+  assert.match(src, /画面推流启动失败，已改用定时截图兜底/, "失败时应给出兜底说明");
+  assert.match(src, /async captureFrame\(\)/, "应能主动截图兜底");
+  assert.match(src, /ensureWatching\(\)/, "应有空白画面巡检");
+  assert.match(src, /noteSubscribers\(/, "应按订阅者数量启停推流");
+  assert.doesNotMatch(src, /Page\.startScreencast",\s*\{[^}]*\}\)\.catch\(\(\) => \{\}\)/, "不得静默吞掉推流启动失败");
+  // 帧预算与超帧丢弃
+  assert.match(src, /MAX_FRAME_BYTES/, "应有单帧字节上限");
+  assert.match(src, /frame\.data\.length > MAX_FRAME_BYTES/, "超限帧应被丢弃");
+  assert.match(src, /everyNthFrame: FRAME_EVERY_NTH/, "推流应使用采样预算");
+  // 交互后补帧，保证推流失效时画面也会更新
+  assert.match(src, /syncFrameSoon\(/, "交互后应补一帧");
+  assert.match(src, /Page\.loadEventFired[\s\S]{0,400}?this\.captureFrame\(\)/, "页面加载完成后应补一帧");
+});
+
+await test("SSE 帧流有背压处理（保留最新帧）", () => {
+  const index = fs.readFileSync(path.join(ROOT, "server", "index.mjs"), "utf8");
+  const stream = index.slice(index.indexOf('app.get("/api/browser/stream"'), index.indexOf('app.post("/api/browser/input"'));
+  assert.match(stream, /pendingFrame/, "应只保留最新一帧");
+  assert.match(stream, /res\.once\("drain"/, "应在 drain 后继续发送");
+  assert.match(stream, /noteSubscribers/, "连接建立/断开应通知会话调整推流");
+  assert.match(stream, /session\.captureFrame\(\)/, "无缓存帧时应先截一帧，避免空白面板");
+});
+
+console.log("\n▶ 浏览器原子操作（Proma 对标，默认关）");
+
+await test("新导出存在：等待 / 点击并等待 / 区域抽取 / 原生下拉", () => {
+  for (const [name, fn] of [["browserWaitFor", browserWaitFor], ["browserAct", browserAct], ["browserExtract", browserExtract], ["browserSelectOption", browserSelectOption]]) {
+    assert.equal(typeof fn, "function", `${name} 应导出为函数`);
+  }
+  assert.equal(typeof browserScroll, "function", "browserScroll 应保留");
+});
+
+await test("默认关：未设开关时四个新能力与容器滚动均报 FLAG_DISABLED", async () => {
+  const { RUNTIME_FLAGS } = await import("../server/运行开关.mjs");
+  if (RUNTIME_FLAGS.browserAtomic) return; // 已开启原子族时由 --live 覆盖
+  const key = browserSessionKey("atomic", "off");
+  await assert.rejects(() => browserWaitFor(key, { text: "x" }), (e) => e.code === "FLAG_DISABLED");
+  await assert.rejects(() => browserAct(key, "e1", { text: "x" }), (e) => e.code === "FLAG_DISABLED");
+  await assert.rejects(() => browserExtract(key, {}), (e) => e.code === "FLAG_DISABLED");
+  await assert.rejects(() => browserSelectOption(key, "e1", { index: 0 }), (e) => e.code === "FLAG_DISABLED");
+  await assert.rejects(() => browserScroll(key, "down", 600, { selector: "#list" }), (e) => e.code === "FLAG_DISABLED");
+});
+
+await test("回归：scroll 缺省分支返回值逐字不变，仅新增可选 options", () => {
+  const src = fs.readFileSync(path.join(ROOT, "server", "内置浏览器.mjs"), "utf8");
+  assert.match(src, /\{ y: window\.scrollY, height: document\.body\.scrollHeight \}/, "缺省滚动分支返回值不得变化");
+  assert.match(src, /export async function browserScroll\(key, direction, amount, options = \{\}\)/, "browserScroll 应新增可选 options 参数");
+});
+
+await test("契约：新工具已登记（agent 定义 + task 单一事实源白名单 + customTools + 开关快照）", () => {
+  const agent = fs.readFileSync(path.join(ROOT, "server", "agent.mjs"), "utf8");
+  const task = fs.readFileSync(path.join(ROOT, "server", "task.mjs"), "utf8");
+  const flags = fs.readFileSync(path.join(ROOT, "server", "运行开关.mjs"), "utf8");
+  const names = ["browser_wait_for", "browser_act", "browser_extract", "browser_select_option"];
+  for (const name of names) {
+    assert.match(agent, new RegExp(`name: "${name}"`), `agent 缺少工具定义 ${name}`);
+    assert.match(task, new RegExp(`"${name}"`), `task 白名单缺少 ${name}`);
+    // 单一事实源收敛后 agent.mjs 只保留定义处字符串；运行时激活改由 task.mjs
+    // 白名单 + customTools 变量数组驱动，不再维护第二份名称串。
+    const quoted = (agent.match(new RegExp(`"${name}"`, "g")) || []).length;
+    assert.equal(quoted, 1, `agent.mjs 应只保留定义处 ${name}（白名单单一事实源在 task.mjs；实际 ${quoted} 处）`);
+  }
+  for (const toolVar of ["browserWaitForTool", "browserActTool", "browserExtractTool", "browserSelectOptionTool"]) {
+    // 2026-11-06 起 browser_* 工具经 wrapBrowserStepTool 包装注册（T6 步骤事件），兼容两种登记形态
+    assert.match(agent, new RegExp(`(wrapBrowserStepTool\\("[a-z]+", ${toolVar}\\))|(${toolVar},)`), `customTools 缺少 ${toolVar}`);
+  }
+  assert.match(flags, /browserAtomic/, "运行开关应含 browserAtomic");
+  for (const key of ["browserAtomic", "browserWaitFor", "browserAct", "browserScrollContainer", "browserExtract", "browserSelectOption"]) {
+    assert.ok((flags.match(new RegExp(`${key}:`, "g")) || []).length >= 2, `运行开关定义与快照应都含 ${key}`);
+  }
+});
+
+console.log("\n▶ 服务端与前端接入点");
+
+await test("agent / task / index / 前端已接入浏览器能力", () => {
+  const agent = fs.readFileSync(path.join(ROOT, "server", "agent.mjs"), "utf8");
+  const task = fs.readFileSync(path.join(ROOT, "server", "task.mjs"), "utf8");
+  const index = fs.readFileSync(path.join(ROOT, "server", "index.mjs"), "utf8");
+  const panel = fs.readFileSync(path.join(ROOT, "client", "src", "components", "内置浏览器面板.jsx"), "utf8");
+  const app = fs.readFileSync(path.join(ROOT, "client", "src", "App.jsx"), "utf8");
+  for (const name of ["browser_open", "browser_snapshot", "browser_click", "browser_type", "browser_press", "browser_scroll", "browser_screenshot", "browser_tabs", "browser_back", "browser_close"]) {
+    assert.match(agent, new RegExp(`name: "${name}"`), `缺少工具 ${name}`);
+    assert.match(task, new RegExp(`"${name}"`), `task 白名单缺少 ${name}`);
+  }
+  assert.match(index, /\/api\/browser\/stream/);
+  assert.match(index, /\/api\/browser\/input/);
+  assert.match(index, /\/api\/browser\/open/, "前端需要可主动打开浏览器会话");
+  assert.match(panel, /EventSource\(`\/api\/browser\/stream/);
+  assert.match(panel, /browserOpen/, "浏览器面板需要支持手动打开网址");
+  assert.match(panel, /browser-idle-open/, "浏览器面板需要提供未启动状态的地址栏");
+  assert.match(panel, /browser-control-toggle/, "浏览器面板需要提供明确的用户接管入口");
+  assert.match(panel, /onToggleFullscreen/, "浏览器面板需要支持铺满工作区");
+  assert.match(app, /browser-fullscreen/, "工作台需要支持浏览器专注模式");
+  assert.match(fs.readFileSync(path.join(ROOT, "server", "内置浏览器.mjs"), "utf8"), /FRAME_QUALITY/, "推流应受帧预算约束（质量/采样）");
+  assert.match(panel, /queueBrowserInput/, "浏览器输入事件必须经过串行队列");
+  assert.match(panel, /action: "resize"/, "浏览器面板尺寸变化需要同步给 CDP viewport");
+  assert.match(fs.readFileSync(path.join(ROOT, "client", "src", "styles.css"), "utf8"), /object-fit: contain/);
+  assert.match(app, /openCanvasView\("browser"\)/, "浏览器活动应打开浏览器标签");
+  assert.match(app, /const browserOpen = canvasTabs\.some\(\(tab\) => tab\.kind === "browser"\)/, "浏览器标签存在性由画布标签推导");
+  assert.doesNotMatch(app, /setPreviewTab\("browser"\)/, "浏览器不应再作为工作产物页签");
+  // 标签页 UI 与文档按 cwd 打开（产物跨工作区）
+  assert.match(panel, /action: "tab_switch"/);
+  assert.match(panel, /action: "tab_new"/);
+  // W4/D01：打开文档改为携带“文件身份”（含 cwd/wsid），由 文件地址.js 统一生成地址
+  assert.match(app, /makeFileIdentity\(\{ workspaceId: effectiveCwd, cwd: effectiveCwd, relativePath: name \}\)/, "打开文档应构造含 cwd 的文件身份");
+  assert.match(app, /buildDocUrls\(/, "预览地址应由统一文件身份生成");
+  assert.match(fs.readFileSync(path.join(ROOT, "client/src/文件地址.js"), "utf8"), /cwd/, "文件身份应包含工作区 cwd");
+  assert.match(index, /resolvePath\(fileName, requestedCwd\)/, "文档接口需支持 cwd 解析");
+});
+
+// ---------- 会话流改版接线（落地文档 2026-10-31-001 §7） ----------
+console.log("\n▶ 会话流改版接线");
+await test("Run 轮次走新路径（已转正），组件与样式齐备", () => {
+  const read = (rel) => fs.readFileSync(path.join(ROOT, rel), "utf8");
+  const chat = read("client/src/components/ChatPanel.jsx");
+  const projection = read("client/src/会话流投影.js");
+  const styles = read("client/src/styles.css");
+  const pkg = JSON.parse(read("package.json"));
+  const flags = read("server/运行开关.mjs");
+  assert.match(chat, /!isUser && Boolean\(m\.runId\)/, "Run 轮次应走新路径（Review 保留旧渲染）");
+  assert.doesNotMatch(chat, /flag\("chatTimelineUi"\)/, "新路径已转正，不应再有 chatTimelineUi 开关判断");
+  assert.doesNotMatch(flags, /OAW_CHAT_TIMELINE/, "转正后服务端不应残留 OAW_CHAT_TIMELINE 开关");
+  assert.match(chat, /<RunFoldBar/, "终态过程应折叠成一行折叠头（规范 v2.0 / ADR 0014）");
+  assert.doesNotMatch(chat, /<RunFold\s/, "不得复用已删除的旧 RunFold 组件");
+  assert.match(chat, /className=\{`tl-list/, "时间流应直接渲染为无框条目列表");
+  assert.match(chat, /<SummaryBlock/, "新路径应渲染框外总结");
+  assert.match(chat, /<ArtifactCard/, "新路径应渲染本轮产物卡");
+  assert.match(chat, /buildRunTimeline/, "新路径应经会话流投影归约时间线");
+  assert.match(chat, /splitCompletionSummary/, "总结应拆分结论与详细展开");
+  assert.match(projection, /export function buildRunTimeline/, "投影模块应导出 buildRunTimeline");
+  assert.match(projection, /export function splitCompletionSummary/, "投影模块应导出 splitCompletionSummary");
+  assert.match(projection, /export function describeRunFold/, "投影模块应导出 describeRunFold 折叠头呈述");
+  for (const comp of ["TimelineRow.jsx", "RunFoldBar.jsx", "SummaryBlock.jsx", "ArtifactCard.jsx"]) {
+    assert.ok(fs.existsSync(path.join(ROOT, "client", "src", "components", "会话流", comp)), `缺少组件文件 ${comp}`);
+  }
+  for (const cls of [".tl-list", ".tl-row-head", ".tl-detail-wrap", ".run-fold-head", ".sum-block", ".sum-body", ".ac-card"]) {
+    assert.ok(styles.includes(cls), `styles.css 缺少会话流样式 ${cls}`);
+  }
+  // 精修计划 2026-10-31-002 接线断言
+  const artifact = read("client/src/components/会话流/ArtifactCard.jsx");
+  assert.match(chat, /import \{ TypewriterText \} from "\.\/会话流\/useTypewriter\.jsx"/, "打字机必须命名导入（默认导出是 hook，误用会渲染出数字）");
+  assert.match(chat, /!block\.answer && !block\.expired/, "已回答/已过期的 ask 必须从常驻交互区移除");
+  assert.match(chat, /showCap/, "流式文本不得显示「阶段结论」标签");
+  assert.match(chat, /跑马灯文本/, "思考折叠态应使用既有跑马灯做滚动预览");
+  assert.match(chat, /tl-row-head no-toggle|locked/, "ask/审批应为 locked 一行头");
+  assert.match(artifact, /product-card-main/, "本轮产物应恢复既有 product-card 行格式");
+  assert.match(artifact, /在产物面板查看/, "本轮产物应保留产物面板入口");
+  assert.match(styles, /--msg-content-max: min\(100%, 720px\)/, "内容列宽令牌应存在");
+  // 字体栈自 1769a23c（2026-11-10 五项计划）起：拉丁/数字由系统字体（Segoe UI）优先渲染、
+  // 中文回落包内 OPPO Sans 4.0 可变字体、末位系统栈兜底（styles.css body 字体策略注释）。
+  assert.match(styles, /font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, "OPPO Sans 4\.0"[^;]*sans-serif/, "字体栈应为系统拉丁优先 + OPPO Sans 4.0 中文回落 + 系统栈兜底");
+  assert.equal(pkg.scripts["test:chat-timeline"], "node scripts/会话流时间线测试.mjs", "应注册 test:chat-timeline 脚本");
+});
+
+if (LIVE) {
+  console.log("\n▶ 真实浏览器链路（Bing 搜索）");
+  const key = browserSessionKey("live", "browser-test");
+  try {
+    await test("启动并打开 Bing", async () => {
+      const state = await browserOpen(key, "https://cn.bing.com");
+      assert.match(state.url, /bing\.com/);
+      const session = getBrowserSession(key);
+      assert.ok(session?.state.active, "会话应为活动状态");
+    });
+    await test("快照包含搜索框元素", async () => {
+      await new Promise((r) => setTimeout(r, 1500));
+      const snap = await browserSnapshot(key);
+      assert.ok(snap.elements.length > 5, `元素过少：${snap.elements.length}`);
+      const target = snap.elements.find((line) => /\[e\d+\] (search|searchbox|textbox|textarea|input)\b/.test(line));
+      assert.ok(target, "未找到搜索框元素");
+    });
+    await test("面板尺寸同步到 CSS viewport", async () => {
+      const resized = await browserUserInput(key, { action: "resize", width: 720, height: 760 });
+      assert.equal(resized.result?.viewport?.width ?? resized.viewport?.width, 720, "viewport 宽度未同步");
+      assert.equal(resized.result?.viewport?.height ?? resized.viewport?.height, 760, "viewport 高度未同步");
+    });
+    await test("输入关键词并提交后出现结果", async () => {
+      const snap = await browserSnapshot(key);
+      const ref = snap.elements.find((line) => /\[e\d+\] (search|searchbox|textbox|textarea|input)\b/.test(line)).match(/\[(e\d+)\]/)[1];
+      await browserType(key, ref, "浙江省综合交通规划", { submit: true });
+      await new Promise((r) => setTimeout(r, 3000));
+      const after = await browserSnapshot(key);
+      assert.match(after.url, /search\?q=/, "未跳转到搜索结果页");
+      assert.match((after.text || "").slice(0, 400), /浙江省|交通|规划/, "结果正文未包含关键词");
+    });
+    await test("拖拽接管：页面收到按下/移动/抬起事件", async () => {
+      const session = getBrowserSession(key);
+      await session.evaluate(`(() => {
+        window.__oawDrag = { down: 0, move: 0, up: 0 };
+        document.addEventListener('mousedown', () => { window.__oawDrag.down += 1; }, true);
+        document.addEventListener('mousemove', () => { window.__oawDrag.move += 1; }, true);
+        document.addEventListener('mouseup', () => { window.__oawDrag.up += 1; }, true);
+        return true;
+      })()`);
+      await browserUserInput(key, { action: "pointer", phase: "down", nx: 0.5, ny: 0.5 });
+      await browserUserInput(key, { action: "pointer", phase: "move", nx: 0.55, ny: 0.5 });
+      await browserUserInput(key, { action: "pointer", phase: "move", nx: 0.6, ny: 0.5 });
+      await browserUserInput(key, { action: "pointer", phase: "up", nx: 0.6, ny: 0.5 });
+      await new Promise((r) => setTimeout(r, 400));
+      const counters = JSON.parse((await session.evaluate("JSON.stringify(window.__oawDrag)")) || "{}");
+      assert.ok(counters.down >= 1 && counters.move >= 1 && counters.up >= 1, `拖拽事件缺失: ${JSON.stringify(counters)}`);
+    });
+    await test("标签页：新建 / 切换 / 关闭", async () => {
+      const { browserTabs } = await import("../server/内置浏览器.mjs");
+      const before = await browserTabs(key, "list");
+      assert.ok(before.tabs.length >= 1, "应有至少一个标签页");
+      const created = await browserTabs(key, "new", "", "about:blank");
+      assert.ok(created.tabId, "新标签页应返回 id");
+      const opened = await browserTabs(key, "list");
+      assert.ok(opened.tabs.some((tab) => tab.id === created.tabId), "新标签页应出现在列表中");
+      const backId = opened.tabs.find((tab) => tab.id !== created.tabId)?.id;
+      await browserTabs(key, "switch", backId);
+      const afterSwitch = await browserTabs(key, "list");
+      assert.equal(afterSwitch.tabs.find((tab) => tab.id === backId)?.active, true, "切换后目标标签应为激活态");
+      await browserTabs(key, "close", created.tabId);
+      const afterClose = await browserTabs(key, "list");
+      assert.ok(!afterClose.tabs.some((tab) => tab.id === created.tabId), "关闭后标签应消失");
+    });
+    await test("原子能力：等待文本（先 false 后 true）", async () => {
+      const missing = await browserWaitFor(key, { text: "绝不可能出现的怪词XYZQWE" }, { timeoutMs: 1200 });
+      assert.equal(missing.matched, false, "不存在的文本应超时返回 matched=false");
+      const hit = await browserWaitFor(key, { text: "搜索" }, { timeoutMs: 8000 });
+      assert.equal(hit.matched, true, "应能等到页面出现「搜索」");
+    });
+    await test("原子能力：区域抽取返回文本与字数", async () => {
+      const out = await browserExtract(key, { selector: "body", maxChars: 800 });
+      assert.ok(out.text.length > 0, "抽取正文不应为空");
+      assert.equal(typeof out.chars, "number");
+      assert.ok(out.chars >= out.text.length, "chars 应为抽取前原文长度");
+    });
+    await test("原子能力：点击并等待（browser_act）", async () => {
+      const snap = await browserSnapshot(key);
+      const box = snap.elements.find((line) => /\[e\d+\] (search|searchbox|textbox|textarea|input)\b/.test(line));
+      if (!box) return console.log("  · 跳过：快照未包含输入框元素");
+      const ref = box.match(/\[(e\d+)\]/)[1];
+      const res = await browserAct(key, ref, { selector: "body" }, { timeoutMs: 5000 });
+      assert.equal(res.matched, true, "点击后 body 条件应满足");
+      assert.equal(res.clicked, ref);
+    });
+    await test("原子能力：原生 <select> 选择", async () => {
+      const session = getBrowserSession(key);
+      await session.evaluate(`(() => {
+        let sel = document.getElementById('__oaw_test_select');
+        if (!sel) {
+          sel = document.createElement('select');
+          sel.id = '__oaw_test_select';
+          sel.innerHTML = '<option value="a">Alpha</option><option value="b">Beta</option>';
+          document.body.appendChild(sel);
+        }
+        return true;
+      })()`);
+      const snap = await browserSnapshot(key);
+      const line = snap.elements.find((l) => /\[e\d+\] select\b/.test(l));
+      if (!line) return console.log("  · 跳过：快照未包含注入的 select（可能超出元素上限）");
+      const ref = line.match(/\[(e\d+)\]/)[1];
+      const res = await browserSelectOption(key, ref, { value: "b" });
+      assert.equal(res.selected.value, "b", "应选中 value=b");
+    });
+    await test("原子能力：内部滚动容器返回 moved 与前后指标", async () => {
+      const session = getBrowserSession(key);
+      await session.evaluate(`(() => {
+        let box = document.getElementById('__oaw_test_scroll');
+        if (!box) {
+          box = document.createElement('div');
+          box.id = '__oaw_test_scroll';
+          box.style.cssText = 'height:120px;overflow:auto;';
+          box.innerHTML = '<div style="height:2000px">滚动测试</div>';
+          document.body.appendChild(box);
+        }
+        box.scrollTop = 0;
+        return true;
+      })()`);
+      const res = await browserScroll(key, "down", 400, { selector: "#__oaw_test_scroll" });
+      assert.ok(res.before && res.after, "应返回前后指标");
+      assert.equal(res.moved, true, "容器应发生滚动");
+    });
+    await test("滚轮接管：归一化坐标滚动页面", async () => {
+      const session = getBrowserSession(key);
+      const before = await session.evaluate("window.scrollY");
+      await browserUserInput(key, { action: "wheel", nx: 0.5, ny: 0.5, deltaY: 900 });
+      await new Promise((r) => setTimeout(r, 600));
+      const after = await session.evaluate("window.scrollY");
+      assert.ok(after >= before, `滚动位置未变化（${before} → ${after}）`);
+      // 面板用户操作后，Agent 侧关闭应被拒绝（保护接管）
+      const kept = await browserClose(key);
+      assert.equal(kept.kept, true, "用户操作后 Agent 关闭应被保留");
+      const forced = await browserClose(key, { force: true });
+      assert.equal(forced.closed, true, "强制关闭应生效");
+    });
+  } catch (error) {
+    fail(`真实链路异常: ${error.message}`);
+  } finally {
+    await browserClose(key).catch(() => {});
+    shutdownBrowsers();
+  }
+} else {
+  console.log("\n（跳过真实浏览器链路：加 --live 运行）");
+}
+
+console.log("\n▶ 可观测性（动作广播与导航进度，2026-11-06 批次）");
+
+await test("agent-action 广播：写操作路径均发出动作事件", () => {
+  const src = fs.readFileSync(path.join(ROOT, "server", "内置浏览器.mjs"), "utf8");
+  assert.match(src, /emitAgentAction\(action\) \{/, "会话应有动作广播方法");
+  const anchor = src.indexOf("emitAgentAction(action) {");
+  const body = src.slice(0, anchor > 0 ? anchor : src.length);
+  for (const [label, method] of [["navigate", "async navigate(rawUrl)"], ["click", "async click(ref)"], ["type", "async type(ref"], ["press", "async press(key)"], ["scroll", "async scroll(direction"], ["scrollContainer", "async scrollContainer(selector"], ["back", "async back()"]]) {
+    const start = src.indexOf(method);
+    assert.ok(start > 0, `应存在 ${label} 方法`);
+    // 方法体可能较长（navigate/click 含完整等待逻辑），统一向前截 1600 字足以覆盖首段广播
+    const segment = src.slice(start, start + 1600);
+    assert.match(segment, /emitAgentAction\(/, `${label} 应发出 agent-action 广播`);
+  }
+  assert.ok(true);
+});
+
+await test("导航进度：state.phase 阶段字段与等待条件联动", () => {
+  const src = fs.readFileSync(path.join(ROOT, "server", "内置浏览器.mjs"), "utf8");
+  assert.match(src, /stateView\(\) \{[\s\S]{0,400}?phase: this\.state\.phase/, "stateView 应暴露 phase");
+  assert.match(src, /this\.state\.phase = "navigating"/, "navigate 应标记 navigating");
+  assert.match(src, /this\.state\.phase = "settling"/, "waitForLoad 应进入 settling 观察窗");
+  assert.match(src, /session\.state\.phase = "waiting-condition"/, "waitForCondition 应标记等待条件");
+  // 阶段结束必须清零：navigate 收尾、settle 结束、条件结束三类出口
+  assert.match(src, /this\.state\.phase = "";/, "阶段结束应清零");
+  assert.match(src, /session\.state\.phase = "";/, "等待条件结束应清零");
+});
+
+await test("前端：隐藏不连帧流，phase 文案与 Blob 渲染路径", () => {
+  const panel = fs.readFileSync(path.join(ROOT, "client", "src", "components", "内置浏览器面板.jsx"), "utf8");
+  assert.match(panel, /if \(!clientId \|\| !visible\) return undefined/, "画布非激活时不应建立帧流连接");
+  assert.match(panel, /\}, \[clientId, threadId, visible\]\)/, "订阅 effect 应依赖 visible");
+  assert.match(panel, /state\.phase === "navigating"/, "状态文案应区分导航阶段");
+  assert.match(panel, /state\.phase === "settling"/, "状态文案应区分稳定观察窗");
+  assert.match(panel, /state\.phase === "waiting-condition"/, "状态文案应区分等待条件");
+  assert.match(panel, /URL\.createObjectURL\(new Blob\(\[bytes\]/, "帧渲染应走 Blob URL 路径");
+  assert.match(panel, /URL\.revokeObjectURL\(frameUrlBacklogRef\.current\.shift\(\)\)/, "Blob URL 应按预算回收");
+  const app = fs.readFileSync(path.join(ROOT, "client", "src", "App.jsx"), "utf8");
+  assert.match(app, /visible=\{activeCanvasTab\?\.kind === "browser"\}/, "App 应把画布激活状态传给浏览器面板");
+});
+
+await test("步骤/读取事件：契约登记且 browser_* 工具统一包装", () => {
+  const registry = fs.readFileSync(path.join(ROOT, "server", "事件注册表.mjs"), "utf8");
+  // 2026-11-06：browser_progress 因无发射点已被移除（事件发射点守护要求「登记即发射」），
+  // 等待进度改由 state.phase 承载；此处只断言实际在用的三个事件。
+  for (const type of ["browser_step_start", "browser_step_end", "browser_read"]) {
+    assert.match(registry, new RegExp(`type: "${type}"`), `${type} 应登记进事件注册表`);
+  }
+  const agent = fs.readFileSync(path.join(ROOT, "server", "agent.mjs"), "utf8");
+  assert.match(agent, /const withBrowserStep = \(kind, execute\)/, "应有步骤包装器");
+  assert.match(agent, /const wrapBrowserStepTool = \(kind, tool\)/, "应有注册期包装");
+  assert.match(agent, /execute: withBrowserStep\(kind, tool\.execute\)/, "包装器应接管 execute");
+  assert.match(agent, /wrapBrowserStepTool\("open", browserOpenTool\)/, "注册表应替换为包装工具");
+  assert.doesNotMatch(agent, /, browserOpenTool,/, "原始工具不得重复注册");
+  assert.match(agent, /emitBrowserRead\(toolCallId, "snapshot"/, "snapshot 应发布 browser_read");
+  assert.match(agent, /emitBrowserRead\(_toolCallId, "extract"/, "extract 应发布 browser_read");
+});
+
+await test("前端时间线：browser-steps 卡可投影、可回放、无摘要", () => {
+  const chat = fs.readFileSync(path.join(ROOT, "client", "src", "components", "ChatPanel.jsx"), "utf8");
+  const projection = fs.readFileSync(path.join(ROOT, "client", "src", "会话流投影.js"), "utf8");
+  const actions = fs.readFileSync(path.join(ROOT, "client", "src", "浏览器动作.js"), "utf8");
+  assert.match(chat, /case "browser_step_start":[\s\S]{0,80}?case "browser_read":/, "SSE 分发应接步骤/读取事件");
+  assert.match(chat, /reduceBrowserSteps\(block\.steps \|\| \[\], type, data\)/, "聚合器应按 toolCallId 归并行");
+  assert.match(chat, /"browser-steps"[\]]\)[;,]?/, "过程块类型应包含 browser-steps");
+  assert.match(chat, /case "browser-steps":/, "新路径渲染应支持 browser-steps");
+  assert.match(chat, /block\.type === "browser-steps"/, "旧路径渲染应支持 browser-steps");
+  assert.match(chat, /function BrowserStepsCard\(/, "时间线卡组件应存在");
+  assert.match(chat, /from "\.\.\/浏览器动作\.js"/, "动词/站点工具应走共享模块");
+  assert.doesNotMatch(chat, /bsc-title">浏览器任务 · \{steps\.length\} 步/, "卡片标题不得带步数摘要");
+  assert.match(projection, /case "browser-steps":/, "buildRunTimeline 必须投影 browser-steps");
+  assert.match(actions, /BROWSER_STEP_VERBS/, "共享动词映射应存在");
+  assert.match(actions, /browserStepHost/, "共享站点归一化应存在");
+  const css = fs.readFileSync(path.join(ROOT, "client", "src", "styles.css"), "utf8");
+  assert.match(css, /\.browser-steps-card/, "时间线样式应存在");
+});
+
+await test("投影回归：browser-steps 块产出时间线条目，空块不产出", async () => {
+  const { buildRunTimeline } = await import("../client/src/会话流投影.js");
+  const steps = [{ toolCallId: "t1", kind: "open", status: "done", url: "https://a.example/x", title: "A" }];
+  const items = buildRunTimeline({ blocks: [{ type: "browser-steps", id: "browser-steps", steps }], trace: null });
+  assert.equal(items.length, 1, "应产出一条浏览器条目");
+  assert.equal(items[0].kind, "browser-steps");
+  assert.equal(items[0].block.steps.length, 1);
+  const empty = buildRunTimeline({ blocks: [{ type: "browser-steps", id: "browser-steps", steps: [] }], trace: null });
+  assert.equal(empty.length, 0, "空步骤块不应产出条目");
+});
+
+await test("操作记录：按 toolCallId 合并、20 条上限、站点独立累计", () => {
+  let result = upsertBrowserAction([], { toolCallId: "t1", kind: "open", status: "running", url: "https://a.example/x", at: 1 });
+  assert.equal(result.created, true);
+  assert.equal(result.list.length, 1);
+  result = upsertBrowserAction(result.list, { toolCallId: "t1", kind: "open", status: "done", url: "https://a.example/x", durationMs: 12, at: 2 });
+  assert.equal(result.created, false, "同 toolCallId 不应新增行");
+  assert.equal(result.list.length, 1);
+  assert.equal(result.list[0].status, "done");
+  result = upsertBrowserAction(result.list, { toolCallId: "t1", kind: "click", status: "done", url: "https://b.example/y", at: 3 });
+  assert.equal(result.urlChanged, true, "开始/结束 URL 不同应标记 urlChanged");
+  for (let i = 0; i < 25; i += 1) {
+    result = upsertBrowserAction(result.list, { toolCallId: `t${i}`, kind: "snapshot", url: `https://h${i}.example/`, at: i + 10 });
+  }
+  assert.equal(result.list.length, 20, "明细只保留最近 20 条");
+  const sites = mergeBrowserSites([], { url: "https://a.example/p", at: 1 });
+  const sites2 = mergeBrowserSites(sites, { url: "https://www.a.example/q", at: 2 });
+  assert.deepEqual(sites2.map((item) => [item.host, item.count]), [["a.example", 2]], "同站点应合并计数");
+  assert.equal(mergeBrowserSites(sites2, { url: "chrome-error://chromewebdata/" }).length, 1, "错误页不是站点");
+});
+
+await test("导航分类：错误页 / 跨站重定向 / 同站", () => {
+  assert.equal(classifyNavigation({ requestedUrl: "https://a.cn/x", finalUrl: "chrome-error://chromewebdata/" }).failed, true);
+  const redirected = classifyNavigation({ requestedUrl: "https://a.cn/x", finalUrl: "https://b.cn/y" });
+  assert.equal(redirected.redirected, true);
+  assert.equal(redirected.finalHost, "b.cn");
+  assert.equal(classifyNavigation({ requestedUrl: "https://a.cn/x", finalUrl: "https://www.a.cn/y" }).redirected, false);
+});
+
+await test("浏览器面板：操作记录默认收起、只渲染数据、无摘要句", () => {
+  const panel = fs.readFileSync(path.join(ROOT, "client", "src", "components", "内置浏览器面板.jsx"), "utf8");
+  assert.match(panel, /const \[actionsOpen, setActionsOpen\] = useState\(false\)/, "默认收起");
+  assert.match(panel, /payload\.type === "actions"/, "应消费 actions 事件");
+  assert.match(panel, /操作记录/, "应有操作记录标题");
+  assert.match(panel, /bal-sites/, "应有站点 chip");
+  assert.doesNotMatch(panel, /操作记录[^\n]*最近/, "收起态不得写最近访问摘要");
+  const chat = fs.readFileSync(path.join(ROOT, "client", "src", "components", "ChatPanel.jsx"), "utf8");
+  assert.match(chat, /browserToolName\.startsWith\("browser_"\) && browserToolName !== "browser_close"/, "任何浏览动作都应拉起面板（close 除外）");
+});
+
+await new Promise((resolve) => setTimeout(resolve, 400));
+console.log(failed ? "\n内置浏览器测试：失败" : "\n内置浏览器测试：通过");
+process.exit(failed ? 1 : 0);

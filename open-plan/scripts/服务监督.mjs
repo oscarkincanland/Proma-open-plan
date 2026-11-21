@@ -1,0 +1,396 @@
+#!/usr/bin/env node
+import fs from "node:fs";
+import http from "node:http";
+import net from "node:net";
+import path from "node:path";
+import { spawn } from "node:child_process";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const SERVER_ENTRY = path.join(ROOT, "server", "index.mjs");
+const LOG_DIR = path.join(ROOT, "运行日志");
+const LOG_FILE = path.join(LOG_DIR, "服务监督.log");
+const HOST = String(process.env.HOST || "127.0.0.1");
+const PORT = Number.parseInt(String(process.env.PORT || "3002"), 10);
+const HEALTH_INTERVAL_MS = 15_000;
+// 健康检查超时必须比控制面超时（client/src/api.js CONTROL_TIMEOUT_MS=8s）更宽松：
+// 多标签/多窗口轮询会话列表时，控制请求排队数秒是正常负载，4s 会频繁误判
+// “服务卡住”并重启，反而中断正在执行的任务、把 Run 打成 recovering。
+const HEALTH_TIMEOUT_MS = 10_000;
+const HEALTH_FAILURE_LIMIT = 3;
+// 冷启动实测已漂移到 ~100s：宽限期必须覆盖它，否则健康检查在启动期内连判 3 次失败，
+// 监督器会把"还在启动"的服务反复 SIGTERM 重启（表现为永远起不来）。
+const STARTUP_GRACE_MS = 180_000;
+const CHILD_STOP_TIMEOUT_MS = 12_000;
+const RAPID_RESTART_WINDOW_MS = 30_000;
+const RAPID_RESTART_LIMIT = 5;
+const RESTART_DELAY_MS = 3_000;
+const RESTART_COOLDOWN_MS = 30_000;
+// 监督器单实例锁：重复 `npm start` / 多个终端同时启动时，只允许一个监督器存活。
+// 否则两个监督器会各自拉起子进程，端口竞争导致 EADDRINUSE、服务在重启窗口内不可用。
+const SUPERVISOR_LOCK_FILE = process.env.OAW_SUPERVISOR_LOCK || path.join(ROOT, ".oaw", "服务监督.lock");
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+export function readSupervisorLock() {
+  try {
+    const value = JSON.parse(fs.readFileSync(SUPERVISOR_LOCK_FILE, "utf8"));
+    return value && Number(value.pid) ? value : null;
+  } catch { return null; }
+}
+
+export function liveSupervisorLock() {
+  const lock = readSupervisorLock();
+  return lock && lock.pid !== process.pid && pidAlive(Number(lock.pid)) ? lock : null;
+}
+
+export function acquireSupervisorLock() {
+  const live = liveSupervisorLock();
+  if (live) return { ok: false, pid: Number(live.pid) };
+  try {
+    fs.mkdirSync(path.dirname(SUPERVISOR_LOCK_FILE), { recursive: true });
+    fs.writeFileSync(SUPERVISOR_LOCK_FILE, JSON.stringify({ pid: process.pid, port: PORT, startedAt: new Date().toISOString() }), "utf8");
+    process.once("exit", releaseSupervisorLock);
+    return { ok: true, pid: process.pid };
+  } catch (error) {
+    return { ok: false, error: error?.message || String(error) };
+  }
+}
+
+export function releaseSupervisorLock() {
+  try {
+    const lock = readSupervisorLock();
+    if (lock && Number(lock.pid) === process.pid) fs.rmSync(SUPERVISOR_LOCK_FILE, { force: true });
+  } catch {}
+}
+
+export function isHealthyPayload(payload, expectedVersion = "") {
+  if (!payload || typeof payload !== "object" || payload.ok !== true) return false;
+  return !expectedVersion || String(payload.version || "") === String(expectedVersion);
+}
+
+export function restartDelayFor({ uptimeMs, rapidFailures }) {
+  const failures = uptimeMs < RAPID_RESTART_WINDOW_MS ? rapidFailures + 1 : 0;
+  return {
+    failures,
+    delayMs: failures >= RAPID_RESTART_LIMIT ? RESTART_COOLDOWN_MS : RESTART_DELAY_MS,
+  };
+}
+
+/**
+ * M1：睡眠/待机唤醒后，定时器会把多次检查合并成一次，表现为相邻两次检查的
+ * 间隔远大于 HEALTH_INTERVAL_MS。此时服务还在恢复，健康检查超时并不代表进程故障；
+ * 必须清零失败计数并跳过本次判定，否则“唤醒 → 连续 3 次失败 → 重启”会误杀服务。
+ */
+export function shouldSkipForResume({ now, lastCheckAt, intervalMs = HEALTH_INTERVAL_MS } = {}) {
+  if (!Number.isFinite(lastCheckAt) || lastCheckAt <= 0) return false;
+  return now - lastCheckAt > Math.max(60_000, intervalMs * 2.5);
+}
+
+function log(message) {
+  const line = `[${new Date().toISOString()}] ${message}`;
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(LOG_FILE, `${line}\n`, "utf8");
+  } catch (error) {
+    process.stderr.write(`${line} (日志写入失败：${error.message})\n`);
+  }
+  if (process.env.OAW_SUPERVISOR_QUIET !== "1") process.stdout.write(`${line}\n`);
+}
+
+function probeHost() {
+  if (HOST === "0.0.0.0" || HOST === "::") return HOST === "::" ? "::1" : "127.0.0.1";
+  return HOST;
+}
+
+function getHealth({ timeoutMs = HEALTH_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    const request = http.get({
+      hostname: probeHost(),
+      port: PORT,
+      path: "/api/status",
+      timeout: timeoutMs,
+      headers: { Accept: "application/json", Connection: "close" },
+    }, (response) => {
+      let body = "";
+      response.setEncoding("utf8");
+      response.on("data", (chunk) => {
+        body += chunk;
+        if (body.length > 32_768) request.destroy(new Error("health response too large"));
+      });
+      response.on("end", () => {
+        try {
+          resolve({ statusCode: response.statusCode, payload: JSON.parse(body) });
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    request.on("timeout", () => request.destroy(new Error("health check timeout")));
+    request.on("error", () => resolve(null));
+  });
+}
+
+function portIsOccupied() {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host: probeHost(), port: PORT });
+    let settled = false;
+    const finish = (occupied) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(occupied);
+    };
+    socket.setTimeout(800, () => finish(false));
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+async function readPackageVersion() {
+  const pkg = JSON.parse(await fs.promises.readFile(path.join(ROOT, "package.json"), "utf8"));
+  return String(pkg.version || "");
+}
+
+async function inspectExistingService(expectedVersion) {
+  const health = await getHealth();
+  if (health && health.statusCode >= 200 && health.statusCode < 300 && health.payload?.ok === true) {
+    const version = String(health.payload.version || "unknown");
+    if (expectedVersion && version !== expectedVersion) {
+      throw new Error(`端口 ${PORT} 上已有 Open Plan 服务（${version}），本地代码为 ${expectedVersion}；为避免前后端版本混用，请先关闭旧服务。`);
+    }
+    return { running: true, version };
+  }
+  if (await portIsOccupied()) {
+    throw new Error(`端口 ${PORT} 已被其他程序占用，但未返回 Open Plan 健康状态；为避免误停其他程序，未启动新实例。`);
+  }
+  return { running: false };
+}
+
+async function launchBackground() {
+  const version = await readPackageVersion();
+  const existing = await inspectExistingService(version);
+  if (existing.running) {
+    log(`Open Plan 已运行：http://${HOST}:${PORT}（${existing.version}）`);
+    return;
+  }
+
+  await fs.promises.mkdir(LOG_DIR, { recursive: true });
+  const logFd = fs.openSync(LOG_FILE, "a");
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), "--foreground"], {
+    cwd: ROOT,
+    env: { ...process.env, OAW_SUPERVISOR_QUIET: "1" },
+    detached: true,
+    windowsHide: true,
+    stdio: ["ignore", logFd, logFd],
+  });
+  child.unref();
+  fs.closeSync(logFd);
+  log(`已启动后台监督进程（PID ${child.pid ?? "unknown"}），等待健康检查。`);
+
+  // 冷启动实测已漂移到 ~100s（runs/事件数据增长 + Pi 运行时初始化）；
+  // 60s 历史窗口必然超时，导致监督器把"还在启动"误判为失败并反复重启。
+  const deadline = Date.now() + 180_000;
+  while (Date.now() < deadline) {
+    const health = await getHealth();
+    if (health && health.statusCode >= 200 && health.statusCode < 300 && isHealthyPayload(health.payload, version)) {
+      log(`Open Plan 已就绪：http://${HOST}:${PORT}（${version}）`);
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  throw new Error(`启动等待超时。请检查 ${LOG_FILE} 获取服务和监督器日志。`);
+}
+
+async function launchForeground() {
+  const version = await readPackageVersion();
+  const existing = await inspectExistingService(version);
+  if (existing.running) {
+    log(`Open Plan 已运行：http://${HOST}:${PORT}（${existing.version}）`);
+    return;
+  }
+
+  let child = null;
+  let stopping = false;
+  let restartRequested = false;
+  let healthFailures = 0;
+  let healthCheckRunning = false;
+  let lastHealthCheckAt = 0;
+  let rapidFailures = 0;
+  let childStartedAt = 0;
+  let stopTimer = null;
+  let restartTimer = null;
+
+  const stop = (signal) => {
+    if (stopping) return;
+    stopping = true;
+    clearInterval(healthTimer);
+    clearTimeout(restartTimer);
+    log(`收到 ${signal}，正在停止监督器。`);
+    if (!child || child.exitCode !== null || child.signalCode !== null) {
+      process.exit(0);
+      return;
+    }
+    child.kill("SIGTERM");
+    stopTimer = setTimeout(() => {
+      if (child && child.exitCode === null && child.signalCode === null) {
+        log("服务未能在宽限期内退出，发送 SIGKILL。 ");
+        child.kill("SIGKILL");
+      }
+    }, CHILD_STOP_TIMEOUT_MS);
+    stopTimer.unref();
+  };
+  process.once("SIGINT", () => stop("SIGINT"));
+  process.once("SIGTERM", () => stop("SIGTERM"));
+
+  const requestRestart = (reason) => {
+    if (stopping || restartRequested || !child) return;
+    restartRequested = true;
+    log(`健康检查连续失败，正在重启服务：${reason}`);
+    child.kill("SIGTERM");
+    stopTimer = setTimeout(() => {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }, CHILD_STOP_TIMEOUT_MS);
+    stopTimer.unref();
+  };
+
+  const healthTimer = setInterval(async () => {
+    const now = Date.now();
+    const previousCheckAt = lastHealthCheckAt;
+    lastHealthCheckAt = now;
+    if (healthCheckRunning || stopping || restartRequested || !child) return;
+    if (now - childStartedAt < STARTUP_GRACE_MS) return;
+    // M1：唤醒后第一次检查不判失败，直接清零计数（详见 shouldSkipForResume）。
+    if (shouldSkipForResume({ now, lastCheckAt: previousCheckAt })) {
+      if (healthFailures) {
+        log(`健康检查间隔跳变 ${Math.round((now - previousCheckAt) / 1000)}s（疑似睡眠/唤醒），清零失败计数。`);
+      }
+      healthFailures = 0;
+      return;
+    }
+    healthCheckRunning = true;
+    try {
+      const health = await getHealth();
+      const isHealthy = health && health.statusCode >= 200 && health.statusCode < 300 && isHealthyPayload(health.payload, version);
+      if (isHealthy) {
+        healthFailures = 0;
+        return;
+      }
+      healthFailures += 1;
+      log(`健康检查失败（${healthFailures}/${HEALTH_FAILURE_LIMIT}）。`);
+      if (healthFailures >= HEALTH_FAILURE_LIMIT) {
+        // M1：重启前记录端口状态，便于事后区分“进程已死”和“进程活着但卡住”。
+        const occupied = await portIsOccupied();
+        requestRestart(`/api/status 不可用或服务版本不匹配（端口${occupied ? "仍在监听，疑似卡住" : "未监听，进程可能已退出"}）`);
+      }
+    } finally {
+      healthCheckRunning = false;
+    }
+  }, HEALTH_INTERVAL_MS);
+  healthTimer.unref();
+
+  const startChild = () => {
+    if (stopping) return;
+    restartRequested = false;
+    healthFailures = 0;
+    childStartedAt = Date.now();
+    log(`启动服务进程（${process.execPath} ${path.relative(ROOT, SERVER_ENTRY)}，版本 ${version}）。`);
+    child = spawn(process.execPath, [SERVER_ENTRY], {
+      cwd: ROOT,
+      env: process.env,
+      windowsHide: true,
+      stdio: "inherit",
+    });
+    child.once("error", (error) => log(`服务进程启动错误：${error.message}`));
+    child.once("close", async (code, signal) => {
+      clearTimeout(stopTimer);
+      if (stopping) {
+        process.exit(0);
+        return;
+      }
+      const uptimeMs = Date.now() - childStartedAt;
+      const exitStatus = signal ? `signal ${signal}` : `exit ${code}`;
+      if (code === 0 && !signal && !restartRequested) {
+        log("服务正常退出，监督器停止。 ");
+        process.exit(0);
+        return;
+      }
+      try {
+        const other = await getHealth();
+        if (other && other.statusCode >= 200 && other.statusCode < 300 && other.payload?.ok === true) {
+          log(`服务进程已退出（${exitStatus}），端口上检测到另一个 Open Plan 实例；监督器停止以避免重复启动。`);
+          process.exit(1);
+          return;
+        }
+        if (await portIsOccupied()) {
+          log(`服务进程已退出（${exitStatus}），端口被其他程序占用；监督器停止以避免反复重启。`);
+          process.exit(1);
+          return;
+        }
+      } catch (error) {
+        log(`端口冲突检查失败：${error.message}`);
+      }
+      const policy = restartDelayFor({ uptimeMs, rapidFailures });
+      rapidFailures = policy.failures;
+      const delay = restartRequested ? 1_000 : policy.delayMs;
+      log(`服务异常退出（${exitStatus}，运行 ${Math.round(uptimeMs / 1000)} 秒），${Math.round(delay / 1000)} 秒后重试。`);
+      restartTimer = setTimeout(startChild, delay);
+    });
+  };
+
+  startChild();
+}
+
+async function printStatus() {
+  const version = await readPackageVersion();
+  const health = await getHealth();
+  const listening = await portIsOccupied();
+  const healthy = Boolean(health && isHealthyPayload(health.payload, version));
+  const payload = {
+    url: `http://${HOST}:${PORT}`,
+    expectedVersion: version,
+    listening,
+    healthy,
+    runningVersion: health?.payload?.version || null,
+    startedAt: health?.payload?.service?.startedAt || null,
+    uptimeSec: health?.payload?.service?.uptimeSec ?? null,
+  };
+  process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
+  return healthy ? 0 : 1;
+}
+
+async function main() {
+  if (!Number.isInteger(PORT) || PORT < 1 || PORT > 65535) throw new Error(`无效 PORT：${process.env.PORT}`);
+  // M1：`npm run service:status` 只读探测，不启动/重启任何进程。
+  if (process.argv.includes("--status")) {
+    process.exitCode = await printStatus();
+    return;
+  }
+  const foreground = process.argv.includes("--foreground");
+  if (foreground) {
+    // 单实例：重复 `npm start` / 多终端同时启动时，不创建第二个监督器。
+    const lock = acquireSupervisorLock();
+    if (!lock.ok) {
+      log(`已有监督器在运行（PID ${lock.pid || "unknown"}），本次不重复启动。`);
+      return;
+    }
+    await launchForeground();
+    return;
+  }
+  const live = liveSupervisorLock();
+  if (live) {
+    log(`已有监督器在运行（PID ${live.pid}），跳过后台启动。`);
+    return;
+  }
+  await launchBackground();
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((error) => {
+    log(`启动失败：${error.message}`);
+    process.exitCode = 1;
+  });
+}

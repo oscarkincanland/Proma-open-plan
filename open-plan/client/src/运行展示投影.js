@@ -1,0 +1,679 @@
+import { reduceRunTrace, summarizeRunTrace, verificationLabel } from "./运行轨迹.js";
+import { flowEventLabel, phaseForEvent } from "./事件展示.js";
+
+/**
+ * 运行展示投影（W1/A01）
+ *
+ * 目标：实时对话、历史恢复、任务中心、文件改动面板共用同一份「一轮任务」视图，
+ * 避免每个组件各自拼装状态、产物与文件清单（当前结果卡/产物面板重复展示即源于此）。
+ *
+ * 约定：
+ *   - 纯函数，无副作用、无 React 依赖，可在测试与 Node 环境直接调用；
+ *   - 权威数据优先：Run 快照（run.completion / finalText）胜过事件推断；
+ *     空事件不得清除已有权威数据；
+ *   - 生命周期（queued/running/…/completed）与目标达成（outcome.status）分开；
+ *   - 非终态事件不得宣告完成；状态缺失显示 unknown（“状态待同步”），不默认 completed；
+ *   - 只投影明确的交付文件为 deliverables，内部/缓存/临时文件归 internal。
+ */
+
+/** 生命周期（与“目标是否达成”分开）。 */
+export const LIFECYCLE_LABELS = Object.freeze({
+  queued: "排队中",
+  running: "执行中",
+  waiting_user: "等待回答",
+  waiting_approval: "等待审批",
+  finalizing: "收尾中",
+  completed: "运行结束",
+  failed: "失败",
+  cancelled: "已取消",
+  unknown: "状态待同步",
+});
+
+export const TERMINAL_LIFECYCLES = Object.freeze(["completed", "failed", "cancelled"]);
+
+export function isTerminalLifecycle(lifecycle) {
+  return TERMINAL_LIFECYCLES.includes(String(lifecycle || ""));
+}
+
+export function lifecycleLabel(lifecycle) {
+  return LIFECYCLE_LABELS[String(lifecycle || "unknown")] || LIFECYCLE_LABELS.unknown;
+}
+
+/** 原始 status / 事件 → 生命周期。缺失或未知状态返回 unknown，绝不默认 completed。 */
+export function normalizeLifecycle(status) {
+  const value = String(status || "").trim().toLowerCase();
+  if (!value || value === "idle") return "unknown";
+  if (["queued", "pending", "admitting", "admitted"].includes(value)) return value === "admitting" ? "running" : "queued";
+  if (["running", "recovering", "recovery", "in_progress", "active"].includes(value)) return "running";
+  if (value === "waiting_user") return "waiting_user";
+  if (["waiting_approval", "waiting_approval_user"].includes(value)) return "waiting_approval";
+  if (["finalizing", "cancel_requested", "cancelling", "canceling"].includes(value)) return "finalizing";
+  if (["completed", "success", "done", "finished"].includes(value)) return "completed";
+  if (["failed", "error"].includes(value)) return "failed";
+  if (["cancelled", "canceled", "aborted", "interrupted"].includes(value)) return "cancelled";
+  return "unknown";
+}
+
+/* ------------------------------ 文件变更分类 ------------------------------ */
+
+// 内部/缓存/临时：不进主交付列表（与服务端 runs.mjs 的噪音规则保持一致的语义）
+const INTERNAL_PATH_PATTERNS = [
+  /(^|\/)\.oaw(\/|$)/i,
+  /(^|\/)(node_modules|__pycache__|\.venv|venv|\.git|\.cache|\.pytest_cache|dist-info|\.turbo|\.parcel-cache)(\/|$)/i,
+  /(^|\/)\./,                       // 隐藏文件与目录（含 .agent-context.*）
+  /(^|\/)\._/,                      // macOS AppleDouble
+  /(^|\/)~\$/,                      // Office 锁文件
+  /\.(tmp|temp|log|bak|old|orig|pyc|pyo|swp|swo)$/i,
+];
+
+export function isInternalChangePath(relativePath) {
+  const value = String(relativePath || "").replace(/\\/g, "/");
+  if (!value) return true;
+  return INTERNAL_PATH_PATTERNS.some((pattern) => pattern.test(value));
+}
+
+function normalizeChangeType(status) {
+  const value = String(status || "").trim().toLowerCase();
+  if (["added", "created", "new"].includes(value)) return "added";
+  if (["deleted", "removed"].includes(value)) return "deleted";
+  if (value === "renamed") return "renamed";
+  if (["modified", "changed", "updated"].includes(value)) return "modified";
+  return "unclassified";
+}
+
+/**
+ * 产物/变更 → FileChange。
+ * source: artifact（服务端已按前后 hash 确认）| suspected（仅 mtime 线索）| incomplete
+ */
+export function normalizeFileChange(input = {}, { runId = null } = {}) {
+  const relativePath = String(input.relativePath || input.path || "").replace(/\\/g, "/");
+  const changeType = normalizeChangeType(input.changeType || input.status);
+  const internal = isInternalChangePath(relativePath);
+  const acceptance = input.acceptance || null;
+  const accepted = ["passed", "warning", "manual_review"].includes(String(acceptance?.status || input.acceptanceStatus || ""));
+  const published = Boolean(input.publication) || String(input.publicationStatus || "") === "published";
+  const role = internal ? "internal"
+    : (input.deliverable === true || accepted || published) ? "deliverable"
+      : "unclassified";
+  return {
+    runId: input.runId || runId || null,
+    changeId: input.changeId || null,
+    workspaceId: input.workspaceId || null,
+    cwd: input.cwd || null,
+    relativePath,
+    changeType,
+    before: input.before ? { hash: input.before.hash || null, size: input.before.size ?? null, reversible: Boolean(input.before.reversible) } : null,
+    after: input.after ? { hash: input.after.hash || null, size: input.after.size ?? null } : (input.size != null ? { hash: null, size: input.size } : null),
+    source: input.source || "artifact",
+    confidence: input.confidence || "confirmed",
+    toolCallId: input.toolCallId || null,
+    role,
+    // 归属：write-ledger / run-window = 归到本轮（后者带"待确认"）；unattributed = 只是线索。
+    attribution: input.source || "artifact",
+    attributed: (input.source || "artifact") !== "unattributed",
+    // 无写入台账的快照差异只是“未归属线索”：可查看，但不能算本轮交付。
+    unattributed: input.source === "unattributed" || input.confidence === "suspected",
+    acceptanceStatus: acceptance?.status || input.acceptanceStatus || null,
+    publishedAt: input.publishedAt || null,
+  };
+}
+
+/* ------------------------------ 事件辅助 ------------------------------ */
+
+function eventRunId(event) {
+  return event?.runId || event?.data?.runId || null;
+}
+
+/** 只保留属于本 Run 的事件：其他 Run 的迟到事件不得改变本 Run 的视图。 */
+function belongsToRun(event, runId) {
+  if (!runId) return true;
+  const value = eventRunId(event);
+  return !value || String(value) === String(runId);
+}
+
+function lastEventOfType(events, types) {
+  const wanted = new Set(Array.isArray(types) ? types : [types]);
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    if (wanted.has(String(events[i]?.type || ""))) return events[i];
+  }
+  return null;
+}
+
+/** 等待原因：待审批 / 待回答（隐藏过程时也必须能找到需要行动的位置）。 */
+function waitingReasonOf(events) {
+  const approvals = new Map();
+  let pendingAsk = null;
+  for (const event of events) {
+    const data = event?.data || {};
+    if (event?.type === "tool_approval_request" && data.id) approvals.set(String(data.id), data);
+    if (event?.type === "tool_approval_resolved" && data.id) approvals.delete(String(data.id));
+    if (event?.type === "ask_user") pendingAsk = data;
+    if (event?.type === "ask_answered" || event?.type === "ask_user_answered") pendingAsk = null;
+  }
+  if (approvals.size) {
+    const first = [...approvals.values()][0];
+    return { kind: "approval", text: `等待你批准：${first.tool || first.target || "工具"}`, approvalId: first.id || null };
+  }
+  if (pendingAsk) return { kind: "ask", text: "等待你回答", question: pendingAsk.question || "" };
+  return null;
+}
+
+/* ------------------------------ 工作阶段与时间线（W7/E01、E03） ------------------------------ */
+
+/** 工作阶段：与生命周期分开；允许“验证 → 再执行”的回退（失败重试），只有生命周期终态不可倒退。 */
+export const WORK_PHASE_ORDER = Object.freeze(["idle", "planning", "executing", "verifying", "delivering"]);
+
+function workPhaseOfEvent(event) {
+  const phase = phaseForEvent(event);
+  if (!phase) return null;
+  if (phase === "done" || phase === "finishing") return "delivering";
+  if (phase === "preparing") return "planning";
+  return WORK_PHASE_ORDER.includes(phase) ? phase : null;
+}
+
+/**
+ * 从事件序列推导工作阶段轨迹：
+ *   - 前进即推进；「验证 → 执行」视为一次重试（attempt+1）；
+ *   - 其余回退忽略（后到的早期事件不把阶段拉回去）。
+ */
+export function deriveWorkPhase(events = []) {
+  let phase = "idle";
+  const attempts = { planning: 0, executing: 0, verifying: 0, delivering: 0 };
+  const trail = [];
+  for (const event of events) {
+    const next = workPhaseOfEvent(event);
+    if (!next || next === phase) continue;
+    const from = WORK_PHASE_ORDER.indexOf(phase);
+    const to = WORK_PHASE_ORDER.indexOf(next);
+    const retry = phase === "verifying" && next === "executing";
+    if (!(to > from || retry)) continue;
+    phase = next;
+    attempts[next] = (attempts[next] || 0) + 1;
+    trail.push({ phase: next, at: event?.at || event?.timestamp || null, attempt: attempts[next], retry });
+  }
+  return { phase, attempts, trail, retries: trail.filter((item) => item.retry).length };
+}
+
+function eventTime(event) {
+  return event?.at || event?.timestamp || event?.createdAt || null;
+}
+
+/** 结构化时间线（E03）：首事件 / 首个模型事件 / 首可见文本 / 模型结束 / 验证结束 / 终态。 */
+export function deriveTimeline(events = [], run = {}) {
+  const firstOf = (types) => {
+    for (const event of events) if (types.includes(String(event?.type || ""))) return eventTime(event);
+    return null;
+  };
+  const lastOf = (types) => {
+    for (let i = events.length - 1; i >= 0; i -= 1) if (types.includes(String(events[i]?.type || ""))) return eventTime(events[i]);
+    return null;
+  };
+  const admitted = firstOf(["run_admitted", "run_admitting", "run_started"]);
+  const firstModelEvent = firstOf(["model_request_started", "thinking", "message_start", "token"]);
+  const firstVisibleText = firstOf(["token", "assistant_final"]);
+  const modelEnd = lastOf(["agent_end", "turn_ended"]);
+  const verificationEnd = lastOf(["artifacts_validated"]);
+  const finished = run.finishedAt || lastOf(["run_finished"]) || null;
+  const ms = (from, to) => (from && to ? Math.max(0, new Date(to).getTime() - new Date(from).getTime()) : null);
+  return {
+    admitted,
+    firstModelEvent,
+    firstVisibleText,
+    modelEnd,
+    verificationEnd,
+    finished,
+    // 分延迟：首事件延迟 / 模型执行 / 后台收尾
+    latencyToFirstEventMs: ms(admitted, firstModelEvent),
+    modelDurationMs: ms(firstModelEvent, modelEnd),
+    tailLatencyMs: ms(modelEnd, finished),
+  };
+}
+
+/* ------------------------------ 主投影 ------------------------------ */
+
+/**
+ * @param {object} run   Run 快照（服务端 Run JSON / 列表摘要 / 旧 RunSummary 消息）
+ * @param {Array} events 该 Run 的事件（实时通道或历史 Run.events）
+ * @returns {object} RunView
+ */
+export function projectRunView(run = {}, events = [], { now = Date.now() } = {}) {
+  const source = run && typeof run === "object" ? run : {};
+  const runId = source.runId || source.id || null;
+  const allEvents = (Array.isArray(events) ? events : []).filter((event) => belongsToRun(event, runId));
+  const trace = reduceRunTrace(allEvents, runId);
+  const stats = summarizeRunTrace(trace);
+
+  // 生命周期：快照 status 优先；快照缺失时用事件推断（但绝不默认 completed）
+  let lifecycle = normalizeLifecycle(source.status || source.lifecycle || "");
+  const waiting = waitingReasonOf(allEvents);
+  if (!isTerminalLifecycle(lifecycle)) {
+    if (waiting?.kind === "approval") lifecycle = "waiting_approval";
+    else if (waiting?.kind === "ask") lifecycle = "waiting_user";
+  }
+  if (lifecycle === "unknown" && allEvents.length) {
+    const ended = lastEventOfType(allEvents, ["run_finished", "agent_end"]);
+    if (ended) {
+      const status = String(ended?.data?.status || "");
+      lifecycle = normalizeLifecycle(status || (ended.type === "run_finished" ? "completed" : "unknown"));
+    }
+  }
+  const terminal = isTerminalLifecycle(lifecycle);
+
+  // 目标达成（outcome）：快照 completion 权威；否则事件推断；非终态不得宣告完成
+  const eventCompletion = trace.completion || null;
+  const snapshotCompletion = source.completion || null;
+  let outcome = snapshotCompletion || eventCompletion || null;
+  if (outcome && !terminal && !source.completion) {
+    // 只有事件推断的完成声明、且运行未终态时，不把它当成最终目标达成
+    outcome = { ...outcome, provisional: true };
+  }
+
+  // 最终回答（answer）：只认权威终稿，重连时替换同一条，不追加第二份
+  const finalText = String(source.finalText || "").trim();
+  const finalMessageId = source.finalMessageId || null;
+  const finalTextVersion = Number(source.finalTextVersion || 0) || 0;
+  const answerEvent = lastEventOfType(allEvents, "assistant_final");
+  const eventText = String(answerEvent?.data?.text || "").trim();
+  const eventMessageId = answerEvent?.data?.messageId || null;
+  const answer = finalText
+    ? { messageId: finalMessageId, version: finalTextVersion, text: finalText, source: "run" }
+    : (eventText ? { messageId: eventMessageId, version: 0, text: eventText, source: "event" } : null);
+
+  // 文件改动：Run 快照的 artifacts 为权威；事件里的 file_changed 只作疑似线索。
+  // 必须保留服务端的归属分级（write-ledger / run-window / unattributed）：
+  // 它决定文件是「已确认的产物」「待确认产物」还是「未归属线索」。此前统一覆盖成
+  // "artifact"，后果是台账确认过的文件也显示「待确认」、「已确认」恒为 0，
+  // 用户看到的就是"文件改动里有、本轮产物里不算数"。
+  const artifactChanges = (Array.isArray(source.artifacts) ? source.artifacts : [])
+    .map((artifact) => normalizeFileChange({
+      ...artifact,
+      source: artifact.source || "artifact",
+      confidence: artifact.confidence || "confirmed",
+    }, { runId }));
+  const knownPaths = new Set(artifactChanges.map((change) => change.relativePath));
+  const suspected = [];
+  for (const event of allEvents) {
+    if (event?.type !== "file_changed") continue;
+    for (const file of Array.isArray(event?.data?.files) ? event.data.files : []) {
+      const relativePath = String(file || "").replace(/\\/g, "/");
+      if (!relativePath || knownPaths.has(relativePath)) continue;
+      knownPaths.add(relativePath);
+      suspected.push(normalizeFileChange({ path: relativePath, status: "modified", source: "event", confidence: "suspected" }, { runId }));
+    }
+  }
+  const changes = [...artifactChanges, ...suspected];
+  const workPhase = deriveWorkPhase(allEvents);
+  const timeline = deriveTimeline(allEvents, source);
+  const deliverables = changes.filter((change) => change.role === "deliverable");
+
+  // 记忆建议：只给待审核入口，不插进主回答
+  const memoryProposalIds = [...new Set(allEvents
+    .filter((event) => event?.type === "memory_proposal" && event?.data?.id)
+    .map((event) => String(event.data.id)))];
+
+  // 当前动作：最近一条“有内容”的事件标签（阶段类事件不参与）
+  const latestEvent = (() => {
+    for (let i = allEvents.length - 1; i >= 0; i -= 1) {
+      const type = String(allEvents[i]?.type || "");
+      if (!type || type === "stats" || type === "token" || type === "heartbeat") continue;
+      return allEvents[i];
+    }
+    return null;
+  })();
+  let currentAction = latestEvent ? String(flowEventLabel(latestEvent) || "") : "";
+
+  return {
+    runId,
+    lifecycle,
+    lifecycleLabel: lifecycleLabel(lifecycle),
+    terminal,
+    outcome,
+    answer,
+    progress: {
+      phase: stats.phase || "idle",
+      workPhase: workPhase.phase,
+      attempts: workPhase.attempts,
+      retries: workPhase.retries,
+      phaseTrail: workPhase.trail,
+      timeline,
+      currentAction,
+      waitingReason: waiting ? waiting.text : null,
+      waitingKind: waiting ? waiting.kind : null,
+      turns: stats.turns,
+      toolTotal: stats.toolTotal,
+      toolFailed: stats.toolFailed,
+      durationMs: stats.durationMs,
+      startedAt: stats.startedAt,
+      endedAt: trace.endedAt || null,
+    },
+    trace: {
+      tools: trace.tools || [],
+      subagents: trace.subagents || [],
+      pipeline: trace.pipeline || null,
+      notes: trace.notes || [],
+      errors: trace.errors || [],
+      files: trace.files || [],
+      todos: trace.todos || [],
+    },
+    changes,
+    deliverables,
+    verification: {
+      status: source.verificationStatus || trace.verification || "not_checked",
+      label: verificationLabel(source.verificationStatus || trace.verification || "not_checked"),
+      checks: Array.isArray(source.validations) ? source.validations : [],
+      source: source.verificationStatus ? "run" : (trace.verification ? "event" : "none"),
+    },
+    memoryProposalIds,
+    // 调试用：投影输入规模，便于排查“事件很多但没变化”
+    meta: { eventCount: allEvents.length, changeCount: changes.length, deliverableCount: deliverables.length, now },
+  };
+}
+
+/**
+ * 旧数据适配器（A02 第 3 条 / A01“旧事件适配器”）：
+ * 历史里的 RunSummary 系统消息（m.summary === true）没有 Run 快照，但有 text/completion/artifacts/products/events。
+ * 这里把它折成 Run 快照形状，喂给同一个投影，避免为历史再写一套展示逻辑。
+ */
+export function adaptLegacyRunSummary(message = {}) {
+  const artifacts = Array.isArray(message.artifacts) && message.artifacts.length
+    ? message.artifacts
+    : (Array.isArray(message.products) ? message.products : []).map((product) => (typeof product === "string" ? { path: product, status: "modified" } : product));
+  return {
+    runId: message.runId || null,
+    status: message.runStatus || null,
+    completion: message.completion || null,
+    verificationStatus: message.verification?.status || message.verificationStatus || null,
+    // 旧 RunSummary 的 text 是 harness 收尾摘要，不是助手最终答复。
+    // 只有明确的 finalText/authoritativeFinalText 才进入答案投影，避免摘要与正文重复。
+    finalText: message.finalText || message.authoritativeFinalText || "",
+    artifacts,
+    cwd: message.workspace || null,
+    productPaths: Array.isArray(message.products) ? message.products : [],
+    model: message.model || null,
+  };
+}
+
+/** 便捷入口：直接投影一条旧 RunSummary 消息。 */
+export function projectLegacyRunSummary(message = {}, events = [], options = {}) {
+  return projectRunView(adaptLegacyRunSummary(message), Array.isArray(events) && events.length ? events : (message.events || []), options);
+}
+
+function readableRunError(error) {
+  const raw = String(error || "").trim();
+  if (!raw) return "";
+  const message = raw.match(/"message"\s*:\s*"([^"]+)"/)?.[1] || "";
+  const status = raw.match(/\b(?:4|5)\d\d\b/)?.[0] || "";
+  if (message) return [status, message].filter(Boolean).join(" ");
+  return raw.replace(/\s+/g, " ").slice(0, 240);
+}
+
+/**
+ * 合并同一 Run 的实时摘要与终态事件。
+ * agent_summary 通常先到，run_finished 随后补齐状态、结论和产物；
+ * 这里集中处理旧消息复用，避免事件处理器依赖 setState updater 内部变量。
+ */
+export function upsertRunSummaryMessage(messages = [], data = {}, {
+  id = null,
+  workspace = "",
+  runMode = "agent",
+  createdAt = Date.now(),
+} = {}) {
+  const list = associateRunMessages(Array.isArray(messages) ? messages : []);
+  const runId = data?.runId || null;
+  if (!runId) return list;
+
+  const index = list.findIndex((item) => item?.summary && item.runId === runId);
+  const previous = index >= 0 ? list[index] : null;
+  const status = data.status || previous?.runStatus || "";
+  const statusText = status === "failed" ? "失败"
+    : status === "cancelled" ? "已取消"
+      : status === "aborted" ? "已中断"
+        : status === "running" ? "执行中"
+          : status === "completed" ? "完成"
+            : "状态待同步";
+  const rawSummary = String(data.summary || data.completion?.summary || previous?.text || `本轮任务${statusText}`).trim();
+  const errorText = String(data.error || previous?.error || "").trim();
+  const failureText = status === "failed" && errorText && (!rawSummary || rawSummary === "任务执行失败")
+    ? `任务执行失败：${readableRunError(errorText)}`
+    : "";
+  const summaryText = failureText || rawSummary;
+  const incomingArtifacts = Array.isArray(data.artifacts) ? data.artifacts : [];
+  const artifacts = incomingArtifacts.length ? incomingArtifacts : null;
+  const incomingProducts = Array.isArray(data.products) ? data.products : [];
+  const products = incomingProducts.length
+    ? incomingProducts
+    : (artifacts || []).map((item) => item?.path).filter(Boolean);
+  const nextArtifacts = artifacts || previous?.artifacts || [];
+  const nextProducts = products.length ? products : (previous?.products || []);
+  // 计划 007 块 B：staging 后被改而跳过落盘的文件必须能看见，否则用户会以为产物凭空消失。
+  const nextMaterializeSkipped = Array.isArray(data.materializeSkipped)
+    ? data.materializeSkipped
+    : (previous?.materializeSkipped || []);
+  const next = {
+    ...(previous || {}),
+    id: previous?.id || id || `run-summary:${runId}`,
+    role: "system",
+    text: summaryText,
+    products: nextProducts,
+    artifacts: nextArtifacts,
+    materializeSkipped: nextMaterializeSkipped,
+    runId,
+    runStatus: status || "unknown",
+    // 本轮实际使用的模型（服务端 run.model）：会话按轮显示"由谁执行"、以及模型切换分割线都读它。
+    model: String(data.model || previous?.model || ""),
+    references: data.references || previous?.references || [],
+    task: data.task || previous?.task || null,
+    workspace: data.workspace || previous?.workspace || workspace || "",
+    runMode: data.task?.mode || previous?.runMode || runMode || "agent",
+    eventCount: Number(data.eventCount || previous?.eventCount || 0),
+    events: Array.isArray(data.events) ? data.events : (previous?.events || []),
+    finalText: String(data.finalText || previous?.finalText || ""),
+    error: errorText,
+    completion: failureText
+      ? { ...(data.completion || previous?.completion || { status: "failed", source: "inferred" }), summary: failureText }
+      : (data.completion || previous?.completion || null),
+    reviewSources: Array.isArray(data.reviewSources) ? data.reviewSources : (previous?.reviewSources || []),
+    status: "done",
+    summary: true,
+    createdAt: previous?.createdAt || createdAt,
+    expanded: false,
+    // 只有“本轮刚刚结束”才做文件改动高亮；历史回放与重连补齐不重播动画。
+    flashFiles: data.fresh === true || previous?.flashFiles === true,
+  };
+  if (index < 0) return associateRunMessages([...list, next]);
+  return associateRunMessages(list.map((item, itemIndex) => itemIndex === index ? next : item));
+}
+
+/**
+ * 内部 harness 提示：写进会话文件时仍是 user 消息，但不属于用户输入，
+ * 既不能在恢复后显示为“You”，也不能截断同一 Run 的过程归约。
+ * 旧版本把“模型连接中断后自动续跑”的提示直接以普通 user 消息写入，
+ * 因此保留旧格式识别，已存在的历史会话无需迁移。
+ * office-pipeline/编辑流水线的 steer 提醒同样以 user 文本写入
+ * （实测会让同一 Run 的摘要卡向前归属被提前截断，旧“运行结果”卡因此复现）。
+ */
+const INTERNAL_HARNESS_PREFIX = /^\s*(?:\[系统提醒\]|系统提醒[：:]|上一个回合的模型连接中断了[。.]|本轮尚未使用\s*(?:editorial_pipeline|编辑流水线)|请立即改用编辑流水线)/;
+
+export function isInternalHarnessMessage(message) {
+  return message?.role === "user" && INTERNAL_HARNESS_PREFIX.test(String(message.text || ""));
+}
+
+/**
+ * 把同一轮里的 assistant 过程消息及系统进度提醒关联到 runId，
+ * 让界面能将它们和 SSE/结论合并到同一个过程面板；真实用户消息仍是分组边界。
+ *
+ * 两遍扫描：
+ *   1) 向前扫描（总结卡之前）：从总结卡往回找最近的真实 user 消息 / 上一张总结卡，
+ *      区间内的 assistant 归到本轮。这是正常布局（总结卡落在本轮消息之后）。
+ *   2) 向后扫描（总结卡之后）：从总结卡往后找下一条真实 user 消息 / 下一张总结卡，
+ *      区间内尚未归属的 assistant 也归到本轮。
+ *      这是自愈分支：历史缓存被写坏、或时间戳漂移时，总结卡可能落在本轮消息之前，
+ *      只靠第 1 遍会让这一轮「没有 assistant 分组」；第 2 遍把它找回来。
+ */
+export function associateRunMessages(messages = []) {
+  const list = Array.isArray(messages) ? messages : [];
+  if (!list.length) return list;
+  let next = list;
+  let changed = false;
+  const at = (index) => (changed ? next : list)[index];
+  const timeOf = (value) => Date.parse(value || "") || 0;
+
+  for (let summaryIndex = 0; summaryIndex < list.length; summaryIndex += 1) {
+    const summary = list[summaryIndex];
+    const runId = String(summary?.role === "system" && summary.summary ? summary.runId || "" : "");
+    if (!runId) continue;
+
+    // 归属下界：优先用 Run startedAt（buildRunSummaryMessages 已带回）。
+    // 同一 Run 内部的 steer/排队指令会以多条 user 消息写入，不能把它们当
+    // “真实用户边界”截断；只有时间早于 Run 开始的消息才属于上一轮。
+    // startedAt 缺失（旧数据/时间戳缺失）时回退到“最近真实 user 边界”的旧规则。
+    const runStartedMs = timeOf(summary?.startedAt || summary?.run?.startedAt) || 0;
+
+    // 第 1 遍：向前（较早）区间——总结卡与上一条边界消息之间。
+    let start = summaryIndex - 1;
+    for (; start >= 0; start -= 1) {
+      const item = list[start];
+      if (item?.role === "system" && item.summary) break;
+      if (runStartedMs) {
+        // 同一 Run 的消息都在 startedAt 之后；时间戳缺失时保守地沿用旧边界，
+        // 避免把明显更早的历史内容硬塞进本轮。
+        const itemMs = timeOf(item?.createdAt) || 0;
+        if (itemMs && itemMs < runStartedMs) break;
+        continue;
+      }
+      if (item?.role === "user" && !isInternalHarnessMessage(item)) break;
+    }
+    for (let index = start + 1; index < summaryIndex; index += 1) {
+      const item = at(index);
+      const internalProcess = isInternalHarnessMessage(item);
+      if ((!internalProcess && item?.role !== "assistant") || (item.runId && item.runId !== runId)) continue;
+      if (item.runId === runId && Boolean(item.internalProcess) === internalProcess) continue;
+      if (!changed) { next = [...list]; changed = true; }
+      next[index] = { ...item, runId, ...(internalProcess ? { internalProcess: true } : {}) };
+    }
+
+    // 第 2 遍：向后（较晚）区间——只补尚未归属的 assistant，不覆盖已有归属。
+    // 自愈窗口有界：孤儿 assistant 必须落在本 Run 的 startedAt 之后；
+    // 摘要卡带 finishedAt 时再以 finishedAt 为上界，避免把下一轮的消息吸进来。
+    const runFinishedMs = timeOf(summary?.finishedAt) || 0;
+    for (let index = summaryIndex + 1; index < list.length; index += 1) {
+      const item = at(index);
+      if (item?.role === "system" && item.summary) break;
+      if (item?.role === "user" && !isInternalHarnessMessage(item)) break;
+      if (item?.role !== "assistant") continue;
+      if (item.runId) continue;
+      // 异常孤儿早于 Run 开始时不硬塞进本轮（时间可用才保护）。
+      const itemMs = timeOf(item?.createdAt) || 0;
+      if (runStartedMs && itemMs && itemMs < runStartedMs) continue;
+      if (runFinishedMs && itemMs && itemMs > runFinishedMs) continue;
+      if (!changed) { next = [...list]; changed = true; }
+      next[index] = { ...item, runId };
+    }
+  }
+  return changed ? next : list;
+}
+
+/**
+ * 遗留气泡去重：恢复链会产生两个 runId——恢复前 run 以一条 summary 卡收尾，
+ * 恢复后 run 的 SSE 把 assistant 消息重新归属（实测卡片 run_8ef… 与 assistant
+ * run_fd9… 共用同一个 01:15~01:17 时间窗）。旧规则只按 runId 相等抑制气泡，
+ * 于是孤儿卡带着旧 RunSummary 形态复现。这里按时间窗判定：summary 的
+ * [startedAt, finishedAt] 窗口内存在已归属其他 run 的 assistant 时，
+ * 该卡不应再以独立气泡出现（折叠条已覆盖同一时间窗）。无时间戳时保守不抑制。
+ */
+export function hiddenLegacySummaryRuns(messages = []) {
+  const list = Array.isArray(messages) ? messages : [];
+  const timeOf = (value) => Date.parse(value || "") || 0;
+  const cards = list
+    .filter((item) => item?.role === "system" && item.summary && item.runId)
+    .map((item) => ({
+      runId: String(item.runId),
+      startedMs: timeOf(item.startedAt || item.run?.startedAt) || 0,
+      finishedMs: timeOf(item.finishedAt) || 0,
+    }));
+  const hidden = new Set();
+  for (const card of cards) {
+    if (!card.startedMs && !card.finishedMs) continue;
+    for (const item of list) {
+      if (item?.role !== "assistant" || !item.runId || String(item.runId) === card.runId) continue;
+      const itemMs = timeOf(item.createdAt) || 0;
+      if (!itemMs) continue;
+      if (card.startedMs && itemMs < card.startedMs) continue;
+      if (card.finishedMs && itemMs > card.finishedMs) continue;
+      hidden.add(card.runId);
+      break;
+    }
+  }
+  return hidden;
+}
+
+/**
+ * 历史恢复：把 Run 总结卡插回消息流（锚点插入）。
+ *
+ * 不能按 createdAt 全局排序——运行中的 Run 只有 startedAt，早于本轮所有消息，
+ * 会让总结卡跑到本轮消息之前；associateRunMessages 只向前扫描，于是整轮 assistant
+ * 消息拿不到 runId，timelinePath 失效、退回旧渲染（切换会话后「格式丢失」）。
+ *
+ * 定位规则（每张总结卡独立定位，消息自身保持 JSONL 原序，不参与排序）：
+ *   - 有 finishedAt → 插到最后一条 createdAt <= finishedAt 的消息之后（本轮收尾锚点）；
+ *   - 无 finishedAt（运行中 / 时间缺失）→ 插到本轮消息之后，而不是按自己的 startedAt
+ *     往前插（往前插会让总结卡落到本轮消息之前，整轮 assistant 失去归属）。
+ *     本轮边界取「下一张卡的 startedAt」；没有下一张卡时就是本列表末尾。
+ */
+export function mergeRunSummaries(messages = [], summaries = []) {
+  const list = Array.isArray(messages) ? messages.slice() : [];
+  const timeOf = (value) => Date.parse(value || "") || 0;
+  const cards = (Array.isArray(summaries) ? summaries : [])
+    .filter((card) => card?.role === "system" && card.summary)
+    .sort((a, b) => timeOf(a?.startedAt || a?.createdAt) - timeOf(b?.startedAt || b?.createdAt));
+  const firstMessageMs = timeOf(list[0]?.createdAt) || 0;
+  cards.forEach((card, cardIndex) => {
+    // 收尾锚点：优先 finishedAt；运行中的卡用下一轮的 startedAt 作为「本轮到此为止」的上界。
+    const end = timeOf(card?.finishedAt) || timeOf(cards[cardIndex + 1]?.startedAt);
+    // 当前窗口之前就已收尾的 Run：它的消息在更早分页里，不能塞进本页末尾。
+    // 早先 insertAt=0 被当成“没找到锚点”，又被改成 list.length，导致所有旧卡
+    // 连锁追加到当前消息流末尾——恢复会话后“失败卡堆在底部、每轮内容看不到”。
+    if (end && firstMessageMs && end < firstMessageMs) return;
+    let insertAt = list.length;
+    if (end) {
+      // 锚点 = 最后一条不晚于该时刻的消息之后；窗口内没有更早消息时放到最前。
+      let anchor = -1;
+      for (let index = list.length - 1; index >= 0; index -= 1) {
+        const time = timeOf(list[index]?.createdAt);
+        if (time && time <= end) { anchor = index; break; }
+      }
+      insertAt = anchor >= 0 ? anchor + 1 : 0;
+    }
+    list.splice(insertAt, 0, card);
+  });
+  return list;
+}
+
+function assistantEntryText(entry = {}) {
+  const content = entry?.message?.content;
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block) => block?.type === "text" || block?.type === "input_text")
+    .map((block) => block.text || block.content || "")
+    .join("\n");
+}
+
+/**
+ * 从会话条目尾部找与权威终稿对应的 assistant 条目。
+ * 实时运行结束后用它回填 entryId/parentId，使“分叉/版本”在实时态与恢复态一致。
+ * 只比较归一化后的开头/结尾，避免把上一轮内容相似的气泡误认成本轮。
+ */
+export function findAssistantEntryByText(entries = [], finalText = "") {
+  const target = String(finalText || "").replace(/\s+/g, " ").trim();
+  if (!target || !Array.isArray(entries)) return null;
+  const sameHead = (a, b) => (a.length <= 160 || b.length <= 160 ? a === b : a.slice(0, 160) === b.slice(0, 160));
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry?.type !== "message" || entry?.message?.role !== "assistant" || !entry.id) continue;
+    const text = assistantEntryText(entry).replace(/\s+/g, " ").trim();
+    if (!text) continue;
+    if (sameHead(text, target) || text.slice(-120) === target.slice(-120)) return entry;
+  }
+  return null;
+}

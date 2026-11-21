@@ -1,0 +1,936 @@
+import React, { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { renderAsync } from "docx-preview";
+import { Document, Packer, Paragraph, TextRun, AlignmentType, HeadingLevel } from "docx";
+import Icon from "./Icon.jsx";
+import CommentMarker from "./CommentMarker.jsx";
+import { repaginateDocx } from "./文档分页.js";
+import { scrollToElementInContainer } from "./文档定位.js";
+import { extractDocxOutline } from "./文档目录.js";
+import { motionScrollBehavior } from "../界面外观.js";
+import { askConfirm } from "./Feedback.jsx";
+import { buildDocUrls, makeFileIdentity, identityMatches, readIdentityHeader, previewStateFromError, PREVIEW_STATE } from "../文件地址.js";
+
+/**
+ * Word 文档查看器（增强版）
+ * - 更多字体和颜色选项，颜色直接显示色块
+ * - 标注颜色（高亮）支持
+ * - 批注显示优化
+ * - 表格支持
+ * - 目录导航
+ */
+const FONT_SIZES = [8, 9, 10, 11, 12, 14, 16, 18, 20, 22, 24, 26, 28, 32, 36, 48, 72];
+const FONT_FAMILIES = [
+  "宋体", "黑体", "仿宋", "楷体", "微软雅黑", "Arial", "Calibri", "Times New Roman", 
+  "Helvetica", "Georgia", "Verdana", "Tahoma", "Trebuchet MS", "Courier New", "Monaco"
+];
+const COLORS = [
+  { name: "黑色", value: "#000000" }, { name: "深灰", value: "#404040" }, { name: "灰色", value: "#808080" }, 
+  { name: "浅灰", value: "#C0C0C0" }, { name: "白色", value: "#FFFFFF" }, { name: "红色", value: "#FF0000" }, 
+  { name: "橙红", value: "#FF4500" }, { name: "橙色", value: "#FFA500" }, { name: "金色", value: "#FFD700" }, 
+  { name: "黄色", value: "#FFFF00" }, { name: "绿色", value: "#00FF00" }, { name: "深绿", value: "#008000" }, 
+  { name: "蓝绿", value: "#00CED1" }, { name: "蓝色", value: "#0000FF" }, { name: "天蓝", value: "#87CEEB" }, 
+  { name: "紫色", value: "#800080" }, { name: "紫罗兰", value: "#EE82EE" }, { name: "粉色", value: "#FFC0CB" }, 
+  { name: "棕色", value: "#A52A2A" }, { name: "海军蓝", value: "#000080" }
+];
+const HIGHLIGHT_COLORS = [
+  { name: "黄色", value: "#FFFF00" }, { name: "绿色", value: "#00FF00" }, { name: "青色", value: "#00FFFF" }, 
+  { name: "粉色", value: "#FFC0CB" }, { name: "蓝色", value: "#87CEEB" }, { name: "紫色", value: "#DDA0DD" }, 
+  { name: "橙色", value: "#FFD700" }, { name: "红色", value: "#FF6347" }, { name: "白色", value: "#FFFFFF" }, 
+  { name: "无", value: "transparent" }
+];
+const HEADING_OPTIONS = [
+  { label: "正文", value: "p" },
+  { label: "标题 1", value: "h1" },
+  { label: "标题 2", value: "h2" },
+  { label: "标题 3", value: "h3" },
+  { label: "标题 4", value: "h4" },
+];
+const ZOOM_LEVELS = [50, 75, 100, 125, 150, 200];
+// D3 大小预算：超过此体积不再走浏览器排版（与 PptxViewer 的 100MB 预算同思路，
+// Word 有图片解压 + 逐块排版 + 二次分页，阈值需要更保守）。
+const DOCX_NATIVE_MAX_BYTES = 25 * 1024 * 1024;
+
+/**
+ * 统计 docx 内浏览器无法解码的矢量图（EMF/WMF）数量。
+ * docx-preview 对这两类完全没有支持分支，命中即为确定性破图——
+ * 必须先识别出来，才能避免「破图 → 整篇 base64 重渲染」的无谓开销。
+ */
+async function countVectorOnlyMedia(buffer) {
+  try {
+    const JSZip = (await import("jszip")).default;
+    const zip = await JSZip.loadAsync(buffer);
+    return Object.keys(zip.files).filter((name) => /^word\/media\/.+\.(?:emf|wmf)$/i.test(name)).length;
+  } catch {
+    return 0;
+  }
+}
+
+export default function DocxViewer({ name, revision = 0, identity, onPreviewState, onPreviewError, onInsertContext, onSendToAgent, onDirtyChange }) {
+  const hostRef = useRef(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  // 浏览器 docx-preview 对复杂 Word 不总是可靠：保留 OfficeCLI HTML 只读回退，
+  // 由用户手动切换（避免每次预览都启动一次服务端渲染进程）。
+  const [renderMode, setRenderMode] = useState("native"); // native | office
+  const officeFrameRef = useRef(null);
+  const [showComments, setShowComments] = useState(true);
+  const [showChanges, setShowChanges] = useState(true); // 修订模式默认开启
+  const [renderKey, setRenderKey] = useState(0);
+  const [mode, setMode] = useState("preview"); // "preview" | "edit"
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState("");
+  const [outlineOpen, setOutlineOpen] = useState(true);
+  // 工具栏「更多」菜单（2026-11-03 预览收敛）：高保真切换、刷新渲染与说明收在这里，
+  // 主工具栏只留高频操作，保证单行不换行。
+  const [moreOpen, setMoreOpen] = useState(false);
+  const moreRef = useRef(null);
+  const [outline, setOutline] = useState([]);
+  const [outlineW, setOutlineW] = useState(220); // 目录宽度（可拖拽）
+  const outlineDragRef = useRef(null);
+  // 文件身份 + 渲染 generation：切文件/刷新时旧渲染结果不得写入新预览。
+  const fileIdentity = useMemo(
+    () => identity || makeFileIdentity({ relativePath: name, revision }),
+    [identity, name, revision],
+  );
+  const urls = useMemo(() => buildDocUrls(fileIdentity), [fileIdentity.workspaceId, fileIdentity.relativePath, fileIdentity.revision]);
+  const renderSeqRef = useRef(0);
+  const renderAbortRef = useRef(null);
+
+  // 目录宽度拖拽（可缩放导航栏）
+  const startOutlineDrag = (e) => {
+    e.preventDefault();
+    outlineDragRef.current = { startX: e.clientX, startW: outlineW };
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    const onMove = (ev) => {
+      const next = Math.min(380, Math.max(160, outlineDragRef.current.startW + (ev.clientX - outlineDragRef.current.startX)));
+      setOutlineW(next);
+    };
+    const onUp = () => {
+      outlineDragRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+  };
+  const [dirty, setDirty] = useState(false);
+  useEffect(() => { onDirtyChange?.(dirty); }, [dirty, onDirtyChange]);
+  useEffect(() => () => onDirtyChange?.(false), [onDirtyChange]);
+  const [comments, setComments] = useState([]);
+  const [activeComment, setActiveComment] = useState(null);
+  const [zoom, setZoom] = useState(100); // 缩放比例
+  const [pageCount, setPageCount] = useState(0);
+  const [currentPage, setCurrentPage] = useState(1);
+  const [selectionMenu, setSelectionMenu] = useState(null);
+  const [selectionNote, setSelectionNote] = useState("");
+  const [imageNotice, setImageNotice] = useState("");
+
+  // 「更多」菜单：点击外部或按 Esc 关闭
+  useEffect(() => {
+    if (!moreOpen) return undefined;
+    const onPointerDown = (event) => {
+      if (!moreRef.current?.contains(event.target)) setMoreOpen(false);
+    };
+    const onKeyDown = (event) => { if (event.key === "Escape") setMoreOpen(false); };
+    document.addEventListener("pointerdown", onPointerDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", onPointerDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [moreOpen]);
+
+  // 选中文档中的文字后显示 Codex 风格操作条：加入上下文、写批注或交给 Agent。
+  useEffect(() => {
+    const host = hostRef.current;
+    const wrap = host?.closest(".oaw-docx-wrap");
+    if (!host || !wrap) return undefined;
+    const handleMouseUp = () => {
+      const sel = window.getSelection?.();
+      if (!sel || sel.rangeCount === 0 || sel.isCollapsed || !sel.toString().trim()) return;
+      const range = sel.getRangeAt(0);
+      if (!host.contains(range.commonAncestorContainer)) return;
+      const rect = range.getBoundingClientRect();
+      if (!rect.width && !rect.height) return;
+      setSelectionMenu({
+        text: sel.toString().replace(/\s+/g, " ").trim().slice(0, 6000),
+        left: Math.max(8, rect.left),
+        top: Math.max(8, rect.bottom + 6),
+      });
+      setSelectionNote("");
+    };
+    const clearOnDown = (event) => {
+      if (!event.target.closest(".doc-selection-popover")) setSelectionMenu(null);
+    };
+    host.addEventListener("mouseup", handleMouseUp);
+    document.addEventListener("mousedown", clearOnDown);
+    return () => {
+      host.removeEventListener("mouseup", handleMouseUp);
+      document.removeEventListener("mousedown", clearOnDown);
+    };
+  }, [renderKey, loading]);
+
+  const closeSelectionMenu = () => {
+    setSelectionMenu(null);
+    setSelectionNote("");
+    window.getSelection?.()?.removeAllRanges?.();
+  };
+
+  const sendSelectionToContext = (instruction = "") => {
+    if (!selectionMenu) return;
+    const text = instruction
+      ? `文件《${name}》选区：\n${selectionMenu.text}\n\n处理要求：${instruction}`
+      : `文件《${name}》选区：\n${selectionMenu.text}`;
+    onInsertContext?.(text);
+    closeSelectionMenu();
+  };
+
+  // 渲染 docx
+  // 缩放：优先用 CSS zoom（布局尺寸随之变化，编辑命中与光标位置精确）；
+  // 老浏览器回退到 transform（带宽度补偿，保证横向仍可滚动）。zoomRef 供适应宽度读取，
+  // 避免把 zoom 放进回调依赖导致每次缩放都重渲染整篇文档。
+  const zoomRef = useRef(100);
+  const applyZoom = useCallback((level) => {
+    const next = Math.max(30, Math.min(300, Number(level) || 100));
+    zoomRef.current = next;
+    setZoom(next);
+    const host = hostRef.current;
+    if (!host) return;
+    const supportsZoom = typeof CSS !== "undefined" && typeof CSS.supports === "function" && CSS.supports("zoom", "1");
+    if (supportsZoom) {
+      host.style.zoom = String(next / 100);
+      host.style.transform = "";
+      host.style.transformOrigin = "";
+      host.style.width = "";
+    } else {
+      host.style.zoom = "";
+      host.style.transform = `scale(${next / 100})`;
+      host.style.transformOrigin = "top left";
+      host.style.width = `${10000 / next}%`;
+    }
+  }, []);
+
+  /** 适应宽度：按真实页宽与面板可用宽度算档位，避免右侧栏把 Word 正文裁掉。 */
+  const applyFitWidth = useCallback((options = {}) => {
+    const host = hostRef.current;
+    if (!host) return 0;
+    const page = host.querySelector(".oaw-docx-wrapper > section.oaw-docx") || host.querySelector("section.oaw-docx");
+    const pageWidth = Number(page?.offsetWidth) || 0;
+    const available = Math.max(0, host.clientWidth - 40);
+    if (!pageWidth || !available) return 0;
+    const ratio = Math.max(0.3, Math.min(3, available / pageWidth));
+    const level = Math.max(30, Math.min(300, Math.round((ratio * 100) / 5) * 5));
+    // 自动模式只缩小以适应，不主动放大（100% 已是舒适阅读尺寸）
+    if (options.silent && level >= zoomRef.current) return level;
+    applyZoom(level);
+    return level;
+  }, [applyZoom]);
+
+  const renderDoc = useCallback(async (options = {}) => {
+    const { signal, isCurrent } = options;
+    const live = () => (typeof isCurrent === "function" ? isCurrent() : true);
+    const host = hostRef.current;
+    if (!host) return;
+    setLoading(true);
+    setError("");
+    setImageNotice("");
+    onPreviewState?.(PREVIEW_STATE.LOADING);
+    try {
+      const res = await fetch(urls.raw, { cache: "no-store", signal });
+      if (!res.ok) throw new Error(`加载失败 HTTP ${res.status}`);
+      // 服务端返回文件身份：与当前文件不符则拒绝渲染，避免同名跨工作区串内容。
+      const serverIdentity = readIdentityHeader(res);
+      if (serverIdentity && !identityMatches(fileIdentity, serverIdentity)) {
+        throw new Error("预览内容与打开的文件不一致（文件身份不匹配），已停止渲染");
+      }
+      // D3 大小预算：超过阈值不再硬渲染（与 PPT 的 LARGE_PPT_BYTES 策略对齐）。
+      // 依据：17MB/28 张图的 Word 实测渲染链路可达十余秒且必然触发破图重渲染。
+      const declaredSize = Number(res.headers.get("content-length") || 0);
+      if (declaredSize > DOCX_NATIVE_MAX_BYTES) {
+        try { await res.body?.cancel(); } catch {}
+        if (!live()) return;
+        setImageNotice(`文件约 ${(declaredSize / 1024 / 1024).toFixed(0)}MB，超过浏览器排版预算，已自动切到 OfficeCLI 高保真预览`);
+        setRenderMode("office");
+        setLoading(false);
+        onPreviewState?.(PREVIEW_STATE.PARTIAL);
+        return;
+      }
+      const buf = await res.arrayBuffer();
+      if (!live()) return;
+
+      // D4：EMF/WMF 是浏览器无法解码的矢量图（docx-preview 零支持），
+      // 命中这类文档时破图是**确定性**的，不能靠 base64 重渲染抢救。
+      const vectorOnlyCount = await countVectorOnlyMedia(buf);
+      if (!live()) return;
+
+      // 批注/修订一律渲染出来，工具栏开关只切 CSS 显隐（D6）——
+      // 旧实现把它们放进 renderAsync 选项，点一次开关就整篇重新渲染。
+      const paint = async (buffer, { base64URL = false } = {}) => {
+        host.innerHTML = "";
+        await renderAsync(new Uint8Array(buffer), host, null, {
+          className: "oaw-docx",
+          inWrapper: true,
+          breakPages: true,
+          // 保留 Word 写入的 lastRenderedPageBreak，避免长文被压成一个连续大页面。
+          ignoreLastRenderedPageBreak: false,
+          renderComments: true,
+          renderChanges: true,
+          useBase64URL: base64URL,
+        });
+      };
+      const brokenImages = async (timeoutMs) => {
+        const deadline = Date.now() + timeoutMs;
+        for (;;) {
+          const images = [...host.querySelectorAll("img")];
+          if (images.length === 0) return [];
+          if (images.every((img) => img.complete)) {
+            return images.filter((img) => img.naturalWidth === 0);
+          }
+          if (Date.now() > deadline) return images.filter((img) => img.complete && img.naturalWidth === 0);
+          await new Promise((resolve) => { setTimeout(resolve, 120); });
+        }
+      };
+
+      await paint(buf);
+      if (!live()) return;
+
+      // 按 A4 页高做二次分页：生成的文档通常没有 Word 的 lastRenderedPageBreak，
+      // 只靠 breakPages 会出现 9000+px 的超长"纸"，这里补上逐页切分。
+      repaginateDocx(host);
+      const pages = host.querySelectorAll("section.oaw-docx");
+      // 目录用 docx 内部样式解析（heading N/标题 N），页号取二次分页后的真实页码
+      const parsedOutline = await extractDocxOutline(buf);
+      if (!live()) return;
+      buildOutline(host, parsedOutline);
+      setPageCount(pages.length || 1);
+      setCurrentPage(1);
+      setDirty(false);
+      // 右侧栏可能比页面窄：默认适应宽度，保证 Word 正文不被裁切。
+      applyFitWidth({ silent: true });
+      // 加载批注数据
+      loadComments({ signal, isCurrent });
+      // D5：先让首屏可读（ready），图片校验放到后台，不再阻塞首屏最多 14 秒。
+      onPreviewState?.(vectorOnlyCount ? PREVIEW_STATE.PARTIAL : PREVIEW_STATE.READY);
+      if (vectorOnlyCount) {
+        setImageNotice(`有 ${vectorOnlyCount} 张 EMF/WMF 矢量图无法在浏览器中渲染（Word 可正常显示）`);
+      }
+
+      // 后台图片校验：仅当不是 EMF/WMF 已知无解时，才用 base64 数据链重渲染一次。
+      void (async () => {
+        const broken = await brokenImages(3000);
+        if (!live()) return;
+        if (!broken.length) return;
+        if (vectorOnlyCount) { setImageNotice(`有 ${broken.length} 张图片未能加载（含 EMF/WMF 矢量图）`); return; }
+        await paint(buf, { base64URL: true });
+        if (!live()) return;
+        repaginateDocx(host);
+        const stillBroken = await brokenImages(4000);
+        if (!live()) return;
+        if (stillBroken.length) setImageNotice(`有 ${stillBroken.length} 张图片未能加载`);
+        onPreviewState?.(stillBroken.length ? PREVIEW_STATE.PARTIAL : PREVIEW_STATE.READY);
+      })().catch(() => {});
+    } catch (e) {
+      if (e?.name === "AbortError") return;
+      if (!live()) return;
+      setError(e.message);
+      onPreviewError?.(e.message);
+      onPreviewState?.(previewStateFromError(e));
+    } finally {
+      if (live()) setLoading(false);
+    }
+  }, [urls, fileIdentity, applyFitWidth, onPreviewState, onPreviewError]);
+
+  const loadComments = async (options = {}) => {
+    const { signal, isCurrent } = options;
+    const live = () => (typeof isCurrent === "function" ? isCurrent() : true);
+    try {
+      const res = await fetch(urls.comments, { cache: "no-store", signal });
+      const serverIdentity = readIdentityHeader(res);
+      if (serverIdentity && !identityMatches(fileIdentity, serverIdentity)) return;
+      const d = await res.json();
+      if (!live()) return;
+      if (d.identity && !identityMatches(fileIdentity, d.identity)) return;
+      if (d.comments) setComments(d.comments);
+    } catch (e) {
+      if (e?.name !== "AbortError") console.error("加载批注失败:", e);
+    }
+  };
+
+  useEffect(() => {
+    if (renderMode !== "native") return undefined;
+    const seq = ++renderSeqRef.current;
+    renderAbortRef.current?.abort();
+    const controller = new AbortController();
+    renderAbortRef.current = controller;
+    renderDoc({ signal: controller.signal, isCurrent: () => seq === renderSeqRef.current });
+    return () => { try { controller.abort(); } catch {} };
+  }, [renderDoc, renderKey, renderMode]);
+
+  // D6：批注/修订开关只切 CSS 显隐，不重新渲染整篇文档（渲染时两者都已产出）。
+  useEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    host.classList.toggle("oaw-hide-comments", !showComments);
+    host.classList.toggle("oaw-hide-changes", !showChanges);
+  }, [showComments, showChanges, renderKey, renderMode, loading]);
+
+  // 提取标题大纲：优先使用 docx 内部样式（heading N / 标题 N）解析出的真实层级；
+  // 解析不到时才退回"编号开头的短段落"启发式，且不再把加粗正文全部列进来。
+  const buildOutline = (host, parsed) => {
+    const clean = (text) => String(text || "").replace(/\s+/g, " ").trim();
+    const compact = (text) => clean(text).replace(/\s+/g, "");
+    const pageOf = (el) => {
+      const section = el?.closest("section.oaw-docx");
+      return section ? Number(section.dataset.page || 0) || null : null;
+    };
+    const parsedItems = Array.isArray(parsed?.items) ? parsed.items : [];
+    const headingClasses = Array.isArray(parsed?.headingClasses) ? parsed.headingClasses : [];
+
+    if (parsedItems.length) {
+      const classLevels = new Map(headingClasses.filter((item) => item.className).map((item) => [item.className, item.level]));
+      const domHeads = classLevels.size
+        ? [...host.querySelectorAll("section.oaw-docx p")].filter((el) => [...el.classList].some((cls) => classLevels.has(cls)))
+        : [];
+      const domText = domHeads.map((el) => compact(el.textContent));
+      const exact = domHeads.length === parsedItems.length
+        && parsedItems.every((item, index) => domText[index] === compact(item.text));
+      const items = [];
+      if (exact) {
+        parsedItems.forEach((item, index) => items.push({ ...item, el: domHeads[index], page: pageOf(domHeads[index]) }));
+      } else {
+        // 顺序配对失败（表格/文本框里的标题等）时按文本顺序兜底匹配
+        let cursor = 0;
+        for (const item of parsedItems) {
+          const key = compact(item.text).slice(0, 24);
+          let hit = null;
+          for (let i = cursor; i < domHeads.length; i += 1) {
+            if (key && (domText[i].startsWith(key) || domText[i].includes(key))) { hit = { el: domHeads[i], index: i }; break; }
+          }
+          if (hit) { cursor = hit.index + 1; items.push({ ...item, el: hit.el, page: pageOf(hit.el) }); }
+          else items.push({ ...item, el: null, page: null });
+        }
+      }
+      setOutline(numberedOutline(items));
+      return;
+    }
+
+    // 兜底启发式
+    const items = [];
+    host.querySelectorAll("section.oaw-docx [class*=heading], section.oaw-docx h1, section.oaw-docx h2, section.oaw-docx h3, section.oaw-docx h4, section.oaw-docx h5, section.oaw-docx h6").forEach((el) => {
+      const cls = el.className || "";
+      let level = 3;
+      if (/heading1/i.test(cls) || el.tagName === "H1") level = 1;
+      else if (/heading2/i.test(cls) || el.tagName === "H2") level = 2;
+      else if (/heading3/i.test(cls) || el.tagName === "H3") level = 3;
+      else if (/heading4/i.test(cls) || el.tagName === "H4") level = 4;
+      else if (/heading5/i.test(cls) || el.tagName === "H5") level = 5;
+      else if (/heading6/i.test(cls) || el.tagName === "H6") level = 6;
+      const text = clean(el.textContent);
+      if (text) items.push({ level, text: text.slice(0, 100), el, page: pageOf(el) });
+    });
+    if (items.length === 0) {
+      const numbered = /^(?:第[一二三四五六七八九十百零\d]+[章节篇部分]|[一二三四五六七八九十百零\d]+、|[（(][一二三四五六七八九十百零\d]+[）)]|\d+(?:\.\d+)+)/;
+      host.querySelectorAll("section.oaw-docx p").forEach((el) => {
+        const text = clean(el.textContent);
+        if (!text || text.length > 60 || !numbered.test(text)) return;
+        let level = 2;
+        if (/^第[一二三四五六七八九十百零\d]+[章节篇部分]|^[一二三四五六七八九十百零\d]+、/.test(text)) level = 1;
+        else if (/^\d+(?:\.\d+){2,}/.test(text)) level = 3;
+        items.push({ level, text: text.slice(0, 100), el, page: pageOf(el) });
+      });
+    }
+    setOutline(numberedOutline(items));
+  };
+
+  // 目录编号：Word 风格的多级序号；标题自带编号（一、/1.1/（一））时不再重复编号
+  const numberedOutline = (items) => {
+    const ownNumber = /^(?:第[一二三四五六七八九十百零\d]+[章节篇部分]|[一二三四五六七八九十百零\d]+[、.．)）]|[（(][一二三四五六七八九十百零\d]+[）)]|\d+(?:\.\d+)+)/;
+    const counters = [];
+    return items.map((item) => {
+      const level = Math.max(1, Math.min(6, item.level || 1));
+      counters[level - 1] = (counters[level - 1] || 0) + 1;
+      for (let i = level; i < counters.length; i += 1) counters[i] = 0;
+      const parts = counters.slice(0, level);
+      const number = ownNumber.test(item.text) || parts.some((value) => !value) ? "" : parts.join(".");
+      return { ...item, level, number };
+    });
+  };
+
+  // 只滚动预览容器，避免把整个工作台一起滚动（zoom 换算统一走 文档定位.js）
+  const scrollHostTo = (el, offset = 16) => {
+    const host = hostRef.current;
+    if (!host || !el) return false;
+    scrollToElementInContainer(host, el, { offset, behavior: motionScrollBehavior() });
+    const page = Number(el.closest("section.oaw-docx")?.dataset.page || 0);
+    if (page) setCurrentPage(page);
+    return true;
+  };
+
+  const jumpToHeading = (item) => {
+    if (!scrollHostTo(item.el, 24) && item.page) jumpToPage(item.page);
+  };
+
+  const jumpToPage = (page) => {
+    const target = Math.max(1, Math.min(pageCount || 1, Number(page) || 1));
+    const el = hostRef.current?.querySelector(`section.oaw-docx[data-page="${target}"]`);
+    if (!el) return;
+    setCurrentPage(target);
+    scrollToElementInContainer(hostRef.current, el, { offset: 8, behavior: motionScrollBehavior() });
+  };
+
+  // ===== 编辑模式：contentEditable + execCommand（即时生效，零后端延迟） =====
+  const mutationRef = useRef(null);
+
+  const enterEditMode = () => {
+    setMode("edit");
+    // 延迟到渲染完成后启用 contentEditable
+    setTimeout(() => {
+      const host = hostRef.current;
+      if (!host) return;
+      // 只对文档正文区域启用编辑（不含注入的 style）
+      const sections = host.querySelectorAll("section.oaw-docx");
+      sections.forEach((s) => { s.contentEditable = "true"; });
+      // 监听内容变化 → 标记 dirty（保存按钮可用）
+      if (mutationRef.current) mutationRef.current.disconnect();
+      const observer = new MutationObserver(() => setDirty(true));
+      sections.forEach((s) => observer.observe(s, { childList: true, subtree: true, characterData: true }));
+      mutationRef.current = observer;
+      setSaveMsg("编辑模式：直接点击文档修改，完成后保存");
+    }, 300);
+  };
+
+  const exitEditMode = () => {
+    if (mutationRef.current) { mutationRef.current.disconnect(); mutationRef.current = null; }
+    const host = hostRef.current;
+    if (host) {
+      host.querySelectorAll("section.oaw-docx").forEach((s) => { s.contentEditable = "false"; });
+    }
+    setMode("preview");
+  };
+
+  // 工具栏动作（execCommand 即时生效）
+  const exec = (cmd, value = null) => {
+    document.execCommand(cmd, false, value);
+    setDirty(true);
+    hostRef.current?.focus();
+  };
+
+  const applyColor = (color) => {
+    document.execCommand("foreColor", false, color);
+    setDirty(true);
+  };
+
+  const applyHighlight = (color) => {
+    if (color === "transparent") {
+      document.execCommand("hiliteColor", false, "transparent");
+    } else {
+      document.execCommand("hiliteColor", false, color);
+    }
+    setDirty(true);
+  };
+
+  // 字号：execCommand 生成 font[size=7] 后替换为实际 pt 值（浏览器通用技巧）
+  const execFontSize = (pt) => {
+    document.execCommand("fontSize", false, "7");
+    const sel = window.getSelection();
+    if (!sel || sel.rangeCount === 0) return;
+    const range = sel.getRangeAt(0);
+    // 找到 execCommand 生成的 font 元素并设置 style.fontSize
+    const container = range.commonAncestorContainer;
+    const root = container.nodeType === 3 ? container.parentElement : container;
+    const fonts = root.querySelectorAll ? root.querySelectorAll('font[size="7"]') : [];
+    fonts.forEach((f) => {
+      f.style.fontSize = `${pt}pt`;
+      f.removeAttribute("size");
+    });
+    setDirty(true);
+  };
+
+  // 标题格式
+  const applyHeading = (tag) => {
+    if (tag === "p") {
+      document.execCommand("formatBlock", false, "p");
+    } else {
+      document.execCommand("formatBlock", false, tag);
+    }
+    setDirty(true);
+    hostRef.current?.focus();
+  };
+
+  // ===== 保存：docx 库重打包 =====
+  const handleSave = async () => {
+    if (!dirty) { setSaveMsg("没有需要保存的修改"); setTimeout(() => setSaveMsg(""), 2000); return; }
+    // 这里的“编辑”是把当前渲染结果重建为新的 docx，不是原包增量修改：
+    // 页眉页脚、图片、表格和未识别的复杂样式都可能丢失，必须显式确认。
+    const editingHost = hostRef.current;
+    const complex = Boolean(editingHost?.querySelector("table, img, header, footer"));
+    const warning = complex
+      ? "当前文档包含表格/图片/页眉页脚。简化编辑保存会重建 docx，这些结构可能丢失。\n\n建议改用 Agent + officecli 修改。仍要保存吗？"
+      : "简化编辑保存会把当前预览重建为新的 docx，复杂样式可能丢失。仍要保存吗？";
+    if (!(await askConfirm(warning))) return;
+    setSaving(true);
+    setSaveMsg("保存中...");
+    try {
+      const host = hostRef.current;
+      // 提取编辑后的正文 HTML（各 section）
+      const sections = host.querySelectorAll("section.oaw-docx");
+      const html = Array.from(sections).map((s) => s.innerHTML).join("");
+
+      // 简易 HTML → docx 转换（支持 p/h1-h6/b/i/u/font-size/font-family/color/table）
+      const parseHtml = (htmlStr) => {
+        const div = document.createElement("div");
+        div.innerHTML = htmlStr;
+        const paras = [];
+        const walk = (node, style) => {
+          const s = { ...style };
+          if (node.nodeType === 3) {
+            const t = node.textContent;
+            if (t.trim()) {
+              paras.push(new Paragraph({ children: [new TextRun({ text: t, bold: s.bold, italics: s.italic, underline: s.underline, size: s.size ? s.size * 2 : undefined, color: s.color, font: s.font, highlighting: s.highlight })], alignment: s.align }));
+            }
+            return;
+          }
+          if (node.nodeType !== 1) return;
+          const tag = node.tagName.toLowerCase();
+          if (tag === "b" || tag === "strong") s.bold = true;
+          if (tag === "i" || tag === "em") s.italic = true;
+          if (tag === "u") s.underline = true;
+          if (tag === "mark") s.highlight = "#FFFF00";
+          if (tag === "span") {
+            const st = node.style || {};
+            if (st.fontWeight === "bold" || parseInt(st.fontWeight, 10) >= 600) s.bold = true;
+            if (st.fontStyle === "italic") s.italic = true;
+            if (st.textDecorationLine === "underline") s.underline = true;
+            if (st.fontSize) s.size = parseInt(st.fontSize, 10);
+            if (st.color) s.color = st.color;
+            if (st.fontFamily) s.font = st.fontFamily.replace(/["']/g, "");
+            if (st.backgroundColor && st.backgroundColor !== "transparent") s.highlight = st.backgroundColor;
+          }
+          if (tag === "h1") s.size = 24, s.bold = true;
+          if (tag === "h2") s.size = 20, s.bold = true;
+          if (tag === "h3") s.size = 16, s.bold = true;
+          if (tag === "p" || tag === "div") {
+            const st = node.style || {};
+            if (st.textAlign) s.align = st.textAlign;
+          }
+          if (["p", "div", "h1", "h2", "h3", "h4", "h5", "h6"].includes(tag)) {
+            // 收集该块内所有文本 run
+            const runs = [];
+            const collectRuns = (n, rs) => {
+              for (const child of n.childNodes) {
+                if (child.nodeType === 3) {
+                  if (child.textContent.trim()) rs.push(new TextRun({ text: child.textContent, bold: s.bold, italics: s.italic, underline: s.underline, size: s.size ? s.size * 2 : undefined, color: s.color, font: s.font, highlighting: s.highlight }));
+                } else if (child.nodeType === 1) {
+                  const cs = { ...s };
+                  const ct = child.tagName.toLowerCase();
+                  if (ct === "b" || ct === "strong") cs.bold = true;
+                  if (ct === "i" || ct === "em") cs.italic = true;
+                  if (ct === "u") cs.underline = true;
+                  if (ct === "mark") cs.highlight = "#FFFF00";
+                  const st = child.style || {};
+                  if (st.fontWeight === "bold") cs.bold = true;
+                  if (st.fontStyle === "italic") cs.italic = true;
+                  if (st.fontSize) cs.size = parseInt(st.fontSize, 10);
+                  if (st.color) cs.color = st.color;
+                  if (st.backgroundColor && st.backgroundColor !== "transparent") cs.highlight = st.backgroundColor;
+                  collectRuns(child, rs);
+                }
+              }
+            };
+            collectRuns(node, runs);
+            if (runs.length) {
+              const heading = tag.startsWith("h") ? { heading: HeadingLevel[tag.toUpperCase()] } : {};
+              paras.push(new Paragraph({ children: runs, alignment: AlignmentType.LEFT, ...heading }));
+            }
+            return;
+          }
+          for (const child of node.childNodes) walk(child, s);
+        };
+        walk(div, {});
+        return paras;
+      };
+
+      const paras = parseHtml(html);
+      const doc = new Document({ sections: [{ children: paras.length ? paras : [new Paragraph({ text: "(空文档)" })] }] });
+      const buffer = await Packer.toBuffer(doc);
+
+      // 上传保存（携带同一份文件身份，避免写错工作区的同名文件）
+      const res = await fetch(urls.rawSave, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ base64: buffer.toString("base64") }),
+      });
+      const d = await res.json();
+      if (!d.ok) throw new Error(d.error || "保存失败");
+      setSaveMsg("保存成功 ✓");
+      setDirty(false);
+      setTimeout(() => setSaveMsg(""), 2500);
+    } catch (e) {
+      setSaveMsg("保存失败: " + e.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="oaw-docx-wrap">
+      {/* 主工具栏（单行）：预览/编辑、批注、修订、目录、页码、缩放、适应宽度、更多 */}
+      <div className="oaw-docx-toolbar">
+        <div className="toolbar-seg oaw-docx-mode">
+          <button className={`toolbar-seg-btn ${mode === "preview" ? "active" : ""}`} onClick={exitEditMode}>
+            <Icon name="eye" size={12} /> 预览
+          </button>
+          <button className={`toolbar-seg-btn ${mode === "edit" ? "active" : ""}`} onClick={enterEditMode}>
+            <Icon name="edit" size={12} /> 编辑
+          </button>
+        </div>
+        <button className={`toolbar-btn ${showComments ? "active" : ""}`} onClick={() => setShowComments(!showComments)} title="显示批注">
+          <Icon name="comment" size={14} />
+        </button>
+        <button className={`toolbar-btn ${showChanges ? "active" : ""}`} onClick={() => setShowChanges(!showChanges)} title="显示修订">
+          <Icon name="history" size={14} />
+        </button>
+        {outline.length > 0 && (
+          <button className={`toolbar-btn ${outlineOpen ? "active" : ""}`} onClick={() => setOutlineOpen(!outlineOpen)} title="目录导航">
+            <Icon name="list" size={14} />
+          </button>
+        )}
+        <span className="toolbar-sep" />
+        {pageCount > 0 && (
+          <div className="oaw-docx-page-nav" aria-label="Word 分页导航">
+            <button className="toolbar-btn" onClick={() => jumpToPage(currentPage - 1)} disabled={currentPage <= 1} title="上一页" aria-label="上一页"><Icon name="chevronLeft" size={14} /></button>
+            <select className="edit-select page-select" value={currentPage} onChange={(e) => jumpToPage(e.target.value)} title="跳转到页码">
+              {Array.from({ length: pageCount }, (_, i) => <option key={i + 1} value={i + 1}>第 {i + 1} 页</option>)}
+            </select>
+            <button className="toolbar-btn" onClick={() => jumpToPage(currentPage + 1)} disabled={currentPage >= pageCount} title="下一页" aria-label="下一页"><Icon name="chevronRight" size={14} /></button>
+          </div>
+        )}
+        <span className="toolbar-sep" />
+        {/* 缩放 */}
+        <select className="edit-select zoom-select" value={zoom} onChange={(e) => applyZoom(Number(e.target.value))} title="缩放比例">
+          {ZOOM_LEVELS.map((z) => <option key={z} value={z}>{z}%</option>)}
+        </select>
+        <button className="toolbar-btn docx-fit-width" onClick={() => applyFitWidth()} title="适应宽度：让页面宽度匹配当前面板，避免正文被裁切">适应宽度</button>
+        {mode === "edit" && (
+          <>
+            <span className="toolbar-sep" />
+            <button className="btn-sm primary" onClick={handleSave} disabled={saving || !dirty} title="保存修改到文档">
+              <Icon name="check" size={12} /> {saving ? "保存中..." : "保存"}
+            </button>
+          </>
+        )}
+        {/* 更多：渲染方式、刷新与预览说明（主工具栏保持单行清爽） */}
+        <div className="docx-more-wrap" ref={moreRef}>
+          <button
+            className={`toolbar-btn ${moreOpen ? "active" : ""}`}
+            onClick={() => setMoreOpen((value) => !value)}
+            aria-haspopup="menu"
+            aria-expanded={moreOpen}
+            aria-label="更多预览选项"
+            title="更多：渲染方式、刷新与预览说明"
+          >
+            <Icon name="more" size={14} />
+          </button>
+          {moreOpen && (
+            <div className="docx-more-menu" role="menu" aria-label="更多预览选项">
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => {
+                  setMoreOpen(false);
+                  if (renderMode === "native" && mode === "edit") exitEditMode();
+                  setError("");
+                  if (renderMode === "native") { setLoading(true); onPreviewState?.(PREVIEW_STATE.LOADING); }
+                  setRenderMode(renderMode === "office" ? "native" : "office");
+                }}
+                title={renderMode === "office" ? "切回浏览器渲染（可编辑）" : "OfficeCLI 高保真只读渲染：适合复杂版式，渲染失败时自动提示"}
+              >
+                <Icon name={renderMode === "office" ? "eye" : "globe"} size={13} />
+                <span>{renderMode === "office" ? "切回浏览器渲染（可编辑）" : "OfficeCLI 高保真预览"}</span>
+                {renderMode === "office" && <em className="docx-more-state">当前：高保真</em>}
+              </button>
+              <button
+                type="button"
+                role="menuitem"
+                onClick={() => { setMoreOpen(false); setRenderKey((k) => k + 1); }}
+                title="重新渲染当前文档"
+              >
+                <Icon name="refresh" size={13} /><span>刷新渲染</span>
+              </button>
+              <p className="docx-more-note">
+                {mode === "edit" ? "编辑模式" : "预览模式"}
+                {pageCount ? ` · 共 ${pageCount} 个预览页` : ""}
+                {imageNotice ? ` · ${imageNotice}` : ""}
+                <br />
+                预览页由浏览器按 A4 排版计算，不保证与 Word 原始页码一致。
+              </p>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 第二行：编辑工具栏（仅编辑模式显示） */}
+      {mode === "edit" && (
+        <div className="oaw-docx-edittoolbar">
+          <div className="edit-group">
+            <select className="edit-select heading-select" title="标题格式" onChange={(e) => applyHeading(e.target.value)} defaultValue="">
+              <option value="" disabled>标题格式</option>
+              {HEADING_OPTIONS.map((h) => <option key={h.value} value={h.value}>{h.label}</option>)}
+            </select>
+          </div>
+          <span className="edit-sep" />
+          <div className="edit-group">
+            <select className="edit-select" title="字号" onChange={(e) => execFontSize(e.target.value)} defaultValue="">
+              <option value="" disabled>字号</option>
+              {FONT_SIZES.map((s) => <option key={s} value={s}>{s}pt</option>)}
+            </select>
+            <select className="edit-select" title="字体" onChange={(e) => exec("fontName", e.target.value)} defaultValue="">
+              <option value="" disabled>字体</option>
+              {FONT_FAMILIES.map((f) => <option key={f} value={f}>{f}</option>)}
+            </select>
+          </div>
+          <span className="edit-sep" />
+          <div className="edit-group">
+            <button className="edit-btn" title="加粗 (Ctrl+B)" onClick={() => exec("bold")}><b>B</b></button>
+            <button className="edit-btn" title="斜体 (Ctrl+I)" onClick={() => exec("italic")}><i>I</i></button>
+            <button className="edit-btn" title="下划线 (Ctrl+U)" onClick={() => exec("underline")}><u>U</u></button>
+            <button className="edit-btn" title="删除线" onClick={() => exec("strikeThrough")}><s>S</s></button>
+          </div>
+          <span className="edit-sep" />
+          <div className="edit-group">
+            <span className="edit-group-label">颜色</span>
+            <div className="edit-color-picker">
+              {COLORS.map((c) => (
+                <button
+                  key={c.value}
+                  className="edit-color-swatch"
+                  title={c.name}
+                  style={{ backgroundColor: c.value }}
+                  onClick={() => applyColor(c.value)}
+                />
+              ))}
+            </div>
+          </div>
+          <span className="edit-sep" />
+          <div className="edit-group">
+            <span className="edit-group-label">标注</span>
+            <div className="edit-color-picker">
+              {HIGHLIGHT_COLORS.map((c) => (
+                <button
+                  key={c.value}
+                  className={`edit-color-swatch highlight ${c.value === "transparent" ? "transparent" : ""}`}
+                  title={c.name}
+                  style={{ backgroundColor: c.value === "transparent" ? "transparent" : c.value }}
+                  onClick={() => applyHighlight(c.value)}
+                />
+              ))}
+            </div>
+          </div>
+          <span className="edit-sep" />
+          <div className="edit-group">
+            <button className="edit-btn" title="左对齐" onClick={() => exec("justifyLeft")}>⇤</button>
+            <button className="edit-btn" title="居中" onClick={() => exec("justifyCenter")}>⇹</button>
+            <button className="edit-btn" title="右对齐" onClick={() => exec("justifyRight")}>⇥</button>
+          </div>
+          <span className="edit-sep" />
+          <span className={`edit-save-msg ${saveMsg.includes("失败") ? "err" : ""}`}>{saveMsg}</span>
+        </div>
+      )}
+
+      {selectionMenu && (
+        <div
+          className="doc-selection-popover"
+          style={{ left: selectionMenu.left, top: selectionMenu.top }}
+          onMouseDown={(event) => event.stopPropagation()}
+        >
+          {!selectionMenu.noteMode ? (
+            <>
+              <span className="doc-selection-count">已选 {selectionMenu.text.length} 字</span>
+              <button type="button" onClick={() => sendSelectionToContext()} title="把选中文本放入对话输入框">加入上下文</button>
+              <button type="button" onClick={() => setSelectionMenu((prev) => ({ ...prev, noteMode: true }))} title="写下批注并注入对话">批注并注入</button>
+              <button type="button" onClick={() => sendSelectionToContext("请分析这段内容并告诉我需要如何修改")}>交给 Agent</button>
+            </>
+          ) : (
+            <>
+              <textarea
+                autoFocus
+                value={selectionNote}
+                onChange={(event) => setSelectionNote(event.target.value)}
+                placeholder="写下对这段文字的批注或修改要求…"
+                onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); sendSelectionToContext(selectionNote.trim()); } }}
+              />
+              <div className="doc-selection-actions">
+                <button type="button" onClick={() => sendSelectionToContext(selectionNote.trim())} disabled={!selectionNote.trim()}>批注并注入</button>
+                <button type="button" className="muted" onClick={closeSelectionMenu}>取消</button>
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {loading && <div className="oaw-docx-loading"><div className="loading-spinner"></div><div>正在渲染文档...</div></div>}
+      {error && (
+        <div className="oaw-docx-error">
+          <Icon name="warning" size={14} /> {error}
+          {renderMode === "native" && (
+            <button className="btn-xs" onClick={() => { setError(""); setLoading(true); onPreviewState?.(PREVIEW_STATE.LOADING); setRenderMode("office"); }}>
+              尝试高保真预览
+            </button>
+          )}
+        </div>
+      )}
+
+      {renderMode === "office" ? (
+        <div className="oaw-docx-office">
+          <iframe
+            ref={officeFrameRef}
+            title={`${name} 高保真预览`}
+            src={urls.html}
+            className="oaw-docx-office-frame"
+            onLoad={() => { setLoading(false); onPreviewState?.(PREVIEW_STATE.PARTIAL); }}
+          />
+          <div className="oaw-docx-office-hint">OfficeCLI 高保真只读渲染；排版异常时可切回浏览器渲染。</div>
+        </div>
+      ) : (
+      <div className="oaw-docx-body">
+        {outlineOpen && outline.length > 0 && (
+          <div className="oaw-docx-outline" style={{ width: outlineW, minWidth: outlineW, maxWidth: outlineW }}>
+            <div className="oaw-docx-outline-head">
+              <span><Icon name="list" size={12} /> 目录{outline.length ? ` (${outline.length})` : ""}</span>
+              <button className="btn-xs" onClick={() => setOutlineOpen(false)} aria-label="关闭大纲"><Icon name="close" size={12} /></button>
+            </div>
+            <div className="oaw-docx-outline-list">
+              {outline.map((item, i) => (
+                <div
+                  key={i}
+                  className={`oaw-docx-outline-item level-${item.level || 1}`}
+                  style={{ paddingLeft: `${(item.level - 1) * 12 + 6}px` }}
+                  onClick={() => jumpToHeading(item)}
+                  title={item.text}
+                >
+                  {item.number ? <span className="oaw-docx-outline-index">{item.number}</span> : null}
+                  <span className="oaw-docx-outline-text">{item.text}</span>
+                  {item.page ? <span className="oaw-docx-outline-page">{item.page}</span> : null}
+                </div>
+              ))}
+            </div>
+            <div className="oaw-docx-outline-resizer" onMouseDown={startOutlineDrag} title="拖动调整目录宽度" />
+          </div>
+        )}
+        <div className="oaw-docx-host" ref={hostRef} />
+        {showComments && comments.length > 0 && (
+          <CommentMarker
+            comments={comments}
+            containerRef={hostRef}
+            activeComment={activeComment}
+            setActiveComment={setActiveComment}
+          />
+        )}
+      </div>
+      )}
+    </div>
+  );
+}

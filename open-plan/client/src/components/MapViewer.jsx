@@ -1,0 +1,1496 @@
+import React, { useEffect, useRef, useState, useCallback, forwardRef, useImperativeHandle } from "react";
+import { Map as MapLibreMap, LngLatBounds, NavigationControl, ScaleControl, Popup } from "maplibre-gl";
+import "maplibre-gl/dist/maplibre-gl.css";
+import shp from "shpjs";
+import Icon from "./Icon.jsx";
+import { mapImportLayer } from "../api.js";
+import { replayTemporaryLayers, clearLayerRegistry, registerLayerReplay, unregisterLayerReplay } from "../图层注册表.js";
+import { 图层默认色, 令牌色, 补充色, 色阶词汇表, 色阶插值表达式, 订阅主题变更, 当前主题 } from "../地图/色板.js";
+
+// 样式文件包含 Agent/用户实时修改，使用查询参数避免浏览器沿用失效的旧样式缓存。
+const STYLE_PATH = (project) => `/api/map/data/${project}/style.json?ts=${Date.now()}`;
+
+// 启动前的兜底底图 id；运行时会从服务端 style.json 同步完整列表。
+const BASEMAP_IDS = ["gaode-road", "gaode-sat", "gaode-sat-label"];
+// 旧底图 id → 新底图 id（老项目 config 里可能存的是 carto/osm/dark/satellite）
+const LEGACY_BASEMAP = { carto: "gaode-road", osm: "gaode-road", dark: "gaode-road", satellite: "gaode-sat" };
+const normalizeBasemap = (id) => {
+  const value = String(id || "").trim();
+  return LEGACY_BASEMAP[value] || value || "gaode-road";
+};
+const styleHash = (text) => text.length + ":" + text.slice(0, 200);
+
+async function parseShapefile(shpjs, shpFile, selected) {
+  const stem = shpFile.name.replace(/\.shp$/i, "");
+  const companion = (ext) => selected.find((x) => (
+    x.name.replace(new RegExp("\\." + ext + "$", "i"), "").toLowerCase() === stem.toLowerCase()
+  ));
+  const dbfFile = companion("dbf");
+  const prjFile = companion("prj");
+  const cpgFile = companion("cpg");
+  const [shpBuffer, dbfBuffer, prjText, cpgText] = await Promise.all([
+    shpFile.arrayBuffer(),
+    dbfFile?.arrayBuffer(),
+    prjFile?.text(),
+    cpgFile?.text(),
+  ]);
+  const geometries = shpjs.parseShp(shpBuffer, prjText || false);
+  const properties = dbfBuffer ? shpjs.parseDbf(dbfBuffer, cpgText || undefined) : undefined;
+  return shpjs.combine([geometries, properties]);
+}
+
+function setBasemapVisibility(map, ids, desired) {
+  if (!map) return desired;
+  const available = ids.filter((id) => map.getLayer(`basemap-${id}`));
+  if (!available.length) return desired;
+  const selected = available.includes(desired) ? desired : (available.includes("gaode-road") ? "gaode-road" : available[0]);
+  for (const id of available) {
+    try { map.setLayoutProperty(`basemap-${id}`, "visibility", id === selected ? "visible" : "none"); } catch {}
+  }
+  return selected;
+}
+
+/**
+ * 地图主区（MapLibre GL）
+ * - 加载 style.json（矢量瓦片图层 + 4 底图）
+ * - 轮询 style.json 感知 agent 修改 → 热更新
+ * - 点击要素弹窗、坐标状态栏
+ * - 导出 PNG / 导入 GeoJSON+SHP（外部 ref API）
+ */
+const MapViewer = forwardRef(function MapViewer(
+  { project = "zhejiang-map", config, onConfigChange, onBasemapResolved, onLayerTilesChanged, onDrillDown, onViewportChange, readOnly = false, initialView = null, reloadToken = 0, drafts = [], onReady = null, onRenderIssue = null },
+  ref
+) {
+  const containerRef = useRef(null);
+  const mapRef = useRef(null);
+  const styleHashRef = useRef("");
+  const popupEnabledRef = useRef(true); // 绘制/测量模式下禁用属性弹窗
+  // 当前 style 中实际存在的底图图层 id（服务端按 Key 配置动态生成）
+  const basemapIdsRef = useRef([...BASEMAP_IDS]);
+  const basemapRef = useRef(normalizeBasemap(config?.basemap));
+  // 路网图层 id（下钻过滤目标：非边界 line 图层 + 标号 symbol 图层）
+  const roadLayerIdsRef = useRef([]);
+  const drillRef = useRef(null);
+  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState("");
+  const [retryToken, setRetryToken] = useState(0);
+  const [basemap, setBasemap] = useState(() => normalizeBasemap(config?.basemap));
+  const [cursor, setCursor] = useState({ lng: null, lat: null, zoom: null });
+  const [importing, setImporting] = useState(false);
+  const [msg, setMsg] = useState(""); // 轻提示
+  const fileInputRef = useRef(null);
+  const drawModeRef = useRef(false); // 绘制/选点模式中（抑制要素弹窗）
+  const stopDrawRef = useRef(null); // 当前绘制会话的清理函数
+  const labelsVisibleRef = useRef(true);
+  const regionFieldCacheRef = useRef(new Map());
+  const coverageModeRef = useRef("region"); // region 当前区域 / city 当前地市 / province 全省
+  const boundaryLabelDataRef = useRef(new Map());
+  const analysisIdsRef = useRef(new Set());
+  const analysisPayloadsRef = useRef(new Map());
+  const analysisKindsRef = useRef(new Map());
+  const analysisHistoryRef = useRef(new Map());
+  const viewportCallbackRef = useRef(onViewportChange);
+  const basemapResolvedCallbackRef = useRef(onBasemapResolved);
+  const viewportTimerRef = useRef(null);
+  // 只读小地图（预览）不上报视口；用 ref 保留最新值，避免建图效果闭包读到旧 prop。
+  const readOnlyRef = useRef(readOnly);
+  // 最后一次真实视口：卸载清理在去抖窗口内补报一次，防止最后一次移动被吞掉。
+  const lastViewportRef = useRef(null);
+  const projectRef = useRef(project);
+
+  useEffect(() => {
+    viewportCallbackRef.current = onViewportChange;
+  }, [onViewportChange]);
+
+  useEffect(() => {
+    readOnlyRef.current = readOnly;
+  }, [readOnly]);
+
+  useEffect(() => {
+    projectRef.current = project;
+  }, [project]);
+
+  useEffect(() => {
+    basemapResolvedCallbackRef.current = onBasemapResolved;
+  }, [onBasemapResolved]);
+
+  const publishBasemap = (selected) => {
+    basemapRef.current = selected;
+    setBasemap(selected);
+    basemapResolvedCallbackRef.current?.(selected);
+  };
+
+  // 运行时标注不写回 style.json，避免 Agent 修改样式时反复覆盖分析状态。
+  const runtimeLabelLayers = ["boundary-city-label", "boundary-county-label"];
+  const runtimeLabelSources = { city: "boundary-city-label-data", county: "boundary-county-label-data" };
+  const labelPoint = (geometry) => {
+    const b = [Infinity, Infinity, -Infinity, -Infinity];
+    const walk = (value) => {
+      if (!Array.isArray(value)) return;
+      if (typeof value[0] === "number") {
+        b[0] = Math.min(b[0], value[0]); b[1] = Math.min(b[1], value[1]);
+        b[2] = Math.max(b[2], value[0]); b[3] = Math.max(b[3], value[1]);
+        return;
+      }
+      value.forEach(walk);
+    };
+    walk(geometry?.coordinates || []);
+    if (b[0] === Infinity) return null;
+    return [(b[0] + b[2]) / 2, (b[1] + b[3]) / 2];
+  };
+  const ensureBoundaryLabelSources = async (map) => {
+    if (!map?.isStyleLoaded?.()) return;
+    for (const [layerName, sourceId] of Object.entries(runtimeLabelSources)) {
+      if (map.getSource(sourceId)) continue;
+      let data = boundaryLabelDataRef.current.get(layerName);
+      if (!data) {
+        try {
+          const response = await fetch(`/api/map/layer?name=${encodeURIComponent(project)}&layer=boundary-${layerName}`);
+          const raw = await response.json();
+          data = {
+            type: "FeatureCollection",
+            features: (raw.features || []).map((feature) => ({
+              type: "Feature",
+              properties: feature.properties || {},
+              geometry: { type: "Point", coordinates: labelPoint(feature.geometry) || [0, 0] },
+            })).filter((feature) => feature.geometry.coordinates[0] || feature.geometry.coordinates[1]),
+          };
+          boundaryLabelDataRef.current.set(layerName, data);
+        } catch { continue; }
+      }
+      try { map.addSource(sourceId, { type: "geojson", data }); } catch {}
+    }
+  };
+  const ensureRuntimeLayers = (map) => {
+    if (!map || !map.isStyleLoaded?.()) return;
+    const addLabel = (id, source, sourceLayer, minzoom, maxzoom, size, color) => {
+      if (!map.getSource(source) || map.getLayer(id)) return;
+      try {
+        map.addLayer({
+          id,
+          type: "symbol",
+          source,
+          ...(sourceLayer ? { "source-layer": sourceLayer } : {}),
+          minzoom,
+          maxzoom,
+          layout: {
+            "text-field": ["coalesce", ["get", "name"], ["get", "名称"], ""],
+            "text-size": ["interpolate", ["linear"], ["zoom"], minzoom, size - 1, maxzoom, size + 2],
+            "text-font": ["Noto Sans Regular"],
+            "symbol-placement": "point",
+            "text-anchor": "center",
+            "text-padding": 14,
+            "text-max-width": 8,
+            "text-optional": true,
+            "icon-optional": true,
+            "text-keep-upright": true,
+            "text-allow-overlap": false,
+            "text-ignore-placement": false,
+            "symbol-z-order": "source",
+          },
+          paint: {
+            "text-color": color,
+            "text-halo-color": "rgba(255,255,255,0.92)",
+            "text-halo-width": 1.6,
+            "text-halo-blur": 0.2,
+          },
+        });
+      } catch {}
+    };
+    addLabel("boundary-city-label", map.getSource(runtimeLabelSources.city) ? runtimeLabelSources.city : "boundary-city", map.getSource(runtimeLabelSources.city) ? null : "boundary-city", 5, 10, 13, "#8f321e");
+    addLabel("boundary-county-label", map.getSource(runtimeLabelSources.county) ? runtimeLabelSources.county : "boundary-county", map.getSource(runtimeLabelSources.county) ? null : "boundary-county", 8, 14, 11, "#344454");
+    const labelIds = new Set([
+      ...runtimeLabelLayers,
+      ...(map.getStyle()?.layers || []).filter((l) => String(l.id).endsWith("-label")).map((l) => l.id),
+    ]);
+    for (const id of labelIds) {
+      if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", labelsVisibleRef.current ? "visible" : "none");
+    }
+  };
+
+  const clearRegionHighlight = (map) => {
+    if (!map) return;
+    for (const id of ["region-highlight-fill", "region-highlight-line", "drill-highlight"]) {
+      try { if (map.getLayer(id)) map.removeLayer(id); } catch {}
+    }
+  };
+
+  const restoreRegionHighlight = (map, d) => {
+    if (!map || !d?.code || !map.isStyleLoaded?.()) return;
+    clearRegionHighlight(map);
+    const source = d.source;
+    if (!source || !map.getSource(source)) return;
+    const before = map.getLayer(source) ? source : undefined;
+    try {
+      map.addLayer({
+        id: "region-highlight-fill",
+        type: "fill",
+        source,
+        "source-layer": source,
+        filter: ["==", "adcode", String(d.code)],
+        paint: { "fill-color": "#facc15", "fill-opacity": 0.16 },
+      }, before);
+      map.addLayer({
+        id: "region-highlight-line",
+        type: "line",
+        source,
+        "source-layer": source,
+        filter: ["==", "adcode", String(d.code)],
+        paint: { "line-color": "#f59e0b", "line-width": 3, "line-opacity": 0.95 },
+      });
+    } catch {}
+  };
+
+  const regionFieldCandidates = (source) => {
+    const fixed = source === "roads-province"
+      ? ["XZQDM"]
+      : source === "roads-trunk"
+        ? ["区划编码", "区划编�", "XZQDM"]
+        : [];
+    return [...fixed, "city_code", "county_code", "adcode", "行政区划代码", "行政区划编码"];
+  };
+
+  const coverageCityCode = (d) => {
+    if (!d?.code) return "";
+    return String(d.cityCode || (d.level === "city" ? d.code : `${String(d.code).slice(0, 4)}00`));
+  };
+
+  const coverageGeometry = (d, coverageMode) => {
+    if (coverageMode === "city" && d?.level === "county") return d.cityGeometry || null;
+    return d?.geometry || null;
+  };
+
+  const getRegionFilter = (map, layer, d, coverageMode = coverageModeRef.current) => {
+    if (!map || !layer?.source || !d?.code) return null;
+    if (coverageMode === "province") return null;
+    const source = String(layer.source);
+    const cacheKey = `${source}:${layer["source-layer"] || ""}`;
+    let field = regionFieldCacheRef.current.get(cacheKey);
+    if (field === undefined) {
+      // 这两个路网源的区划字段已由数据规范固定，避免每次切换区域都扫描整片矢量瓦片。
+      if (source === "roads-province") field = "XZQDM";
+      else if (source === "roads-trunk") field = "区划编�";
+      else field = null;
+      regionFieldCacheRef.current.set(cacheKey, field);
+    }
+    const targetLevel = coverageMode === "city" ? "city" : d.level;
+    const code = String(d.code);
+    const targetCode = targetLevel === "county" ? code : `${code.slice(0, 4)}00`;
+    if (field && targetLevel === "county") return ["==", ["to-string", ["get", field]], targetCode];
+    if (field) return ["==", ["slice", ["to-string", ["get", field]], 0, 4], targetCode.slice(0, 4)];
+    // 设施点和部分 OSM 图层没有区划字段，用当前区域边界做空间过滤。
+    // 这只作为没有编码字段时的兜底，避免每次切换都扫描整片矢量瓦片。
+    const geometry = coverageGeometry(d, coverageMode);
+    if (geometry && (layer.type === "circle" || layer.type === "fill" || layer.type === "line" || layer.type === "symbol")) {
+      const featureGeometry = geometry.type === "Feature" ? geometry : { type: "Feature", properties: {}, geometry };
+      return ["within", featureGeometry];
+    }
+    return null;
+  };
+
+  const applyDrillFilters = (map, d) => {
+    if (!map || !d?.code) return;
+    for (const id of roadLayerIdsRef.current) {
+      const layer = map.getLayer(id);
+      if (!layer) continue;
+      const filter = getRegionFilter(map, layer, d, coverageModeRef.current);
+      if (filter) map.setFilter(id, filter);
+      else map.setFilter(id, null);
+    }
+  };
+
+  const applyBoundaryFilters = (map, d) => {
+    if (!map || !d?.code) return;
+    const cityLayer = map.getLayer("boundary-city");
+    const countyLayer = map.getLayer("boundary-county");
+    const mode = coverageModeRef.current;
+    const cityCode = coverageCityCode(d);
+    // 选择地市时，即使道路范围仍是“当前区域”，也要把该地市及下辖区县边界固定下来。
+    // 之前只有切换到“当前地市”模式才过滤边界，导致选择杭州后边界要么全省混杂，要么视觉上不可见。
+    if (!cityCode || (d.level !== "city" && d.level !== "county" && mode !== "city")) {
+      if (cityLayer) map.setFilter("boundary-city", null);
+      if (countyLayer) map.setFilter("boundary-county", null);
+      return;
+    }
+    if (cityLayer) map.setFilter("boundary-city", ["==", ["to-string", ["get", "adcode"]], cityCode]);
+    if (countyLayer) {
+      const countyFilter = d.level === "county" && mode !== "city"
+        ? ["==", ["to-string", ["get", "adcode"]], String(d.code)]
+        : ["match", ["slice", ["to-string", ["get", "adcode"]], 0, 4], [cityCode.slice(0, 4)], true, false];
+      map.setFilter("boundary-county", countyFilter);
+    }
+  };
+
+  const applyDrillState = (map, d) => {
+    if (!map || !d?.code || !map.isStyleLoaded?.()) return false;
+    ensureRuntimeLayers(map);
+    clearRegionHighlight(map);
+    restoreRegionHighlight(map, d);
+    applyDrillFilters(map, d);
+    applyBoundaryFilters(map, d);
+    // 下钻时只保留当前地市/县市区范围内的行政区名称，避免沿海多岛和底图标签叠加造成重复。
+    const cityLabel = map.getLayer("boundary-city-label");
+    const countyLabel = map.getLayer("boundary-county-label");
+    const code = String(d.code);
+    if (cityLabel) map.setFilter("boundary-city-label", d.level === "city"
+      ? ["==", ["to-string", ["get", "adcode"]], code]
+      : ["==", "__selected_county_city_label__", "__never__"]);
+    if (countyLabel) {
+      map.setFilter("boundary-county-label", coverageModeRef.current === "city"
+        ? ["match", ["slice", ["to-string", ["get", "adcode"]], 0, 4], [coverageCityCode(d).slice(0, 4)], true, false]
+        : d.level === "county"
+          ? ["==", ["to-string", ["get", "adcode"]], code]
+          : ["match", ["slice", ["to-string", ["get", "adcode"]], 0, 4], [code.slice(0, 4)], true, false]);
+    }
+    return true;
+  };
+
+  const geometryBounds = (geojson) => {
+    const b = [Infinity, Infinity, -Infinity, -Infinity];
+    const walk = (g) => {
+      if (!g) return;
+      if (g.type === "FeatureCollection") return (g.features || []).forEach((f) => walk(f));
+      if (g.type === "Feature") return walk(g.geometry);
+      if (g.type === "Point") return walk(g.coordinates);
+      if (Array.isArray(g) && typeof g[0] === "number") {
+        b[0] = Math.min(b[0], g[0]); b[1] = Math.min(b[1], g[1]);
+        b[2] = Math.max(b[2], g[0]); b[3] = Math.max(b[3], g[1]);
+        return;
+      }
+      if (Array.isArray(g)) g.forEach(walk);
+      else if (g.coordinates) walk(g.coordinates);
+    };
+    walk(geojson);
+    return b[0] === Infinity ? null : b;
+  };
+
+  const removeAnalysisLayers = (map, id = "agent-analysis") => {
+    const layerIds = [`${id}-heat`, `${id}-circles`, `${id}-labels`, `${id}-fill`, `${id}-line`, `${id}-od-lines`];
+    for (const layerId of layerIds) {
+      try { if (map?.getLayer(layerId)) map.removeLayer(layerId); } catch {}
+    }
+    try { if (map?.getSource(`${id}-source`)) map.removeSource(`${id}-source`); } catch {}
+    try { if (map?.getSource(`${id}-lines-source`)) map.removeSource(`${id}-lines-source`); } catch {}
+    analysisIdsRef.current.delete(id);
+    analysisPayloadsRef.current.delete(id);
+    analysisKindsRef.current.delete(id);
+  };
+
+  // ---- 草稿层渲染（2026-11-07）：Agent 生成、等待用户确认固化的点/线/面 ----
+  // 只画在运行时，不写 style.json（方案 2026-11-18-002 C1/C2）。
+  // 竞态仲裁：本函数是草稿变更的**单一串行入口**——
+  //   · style 未就绪（含 setStyle 热更窗口，运行时图层会被清掉）→ 只记账（draftListRef），
+  //     由 markReady / applyStyle("idle") 统一重放，绝不在此窗口对运行时 source setData；
+  //   · style 已就绪 → 按 draftId 增量 diff（内容签名含 revision/style/几何类型/要素数），
+  //     仅变更草稿重建、未变草稿跳过、消失草稿移除，替代旧的"每次事件整层销毁重建"；
+  //   · 重放自愈：重放时若 meta 说已渲染但 map.getLayer 缺失（setStyle 清层后），按缺失重建。
+  // props 同步路径（MapPanel 懒加载前已持列表）经同一入口按 draftId+revision 去重，
+  // 本地显隐切换不改服务端 revision，故签名保留 visible 维度。
+  const draftListRef = useRef([]);
+  const draftLayerIdsRef = useRef(new Set());
+  const draftMetaRef = useRef(new Map()); // slugId → { sig, visible }
+  const onRenderIssueRef = useRef(onRenderIssue);
+  const onReadyRef = useRef(onReady);
+  useEffect(() => { onRenderIssueRef.current = onRenderIssue; }, [onRenderIssue]);
+  useEffect(() => { onReadyRef.current = onReady; }, [onReady]);
+
+  const draftSlug = (raw) => `draft-${String(raw || "x").replace(/^draft-/, "").replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+
+  const removeDraftById = (m, id) => {
+    const ids = [id];
+    if (m.getLayer(`${id}-line`)) ids.push(`${id}-line`);
+    for (const lid of ids) {
+      try { if (m.getLayer(lid)) m.removeLayer(lid); } catch {}
+      try { if (m.getSource(lid)) m.removeSource(lid); } catch {}
+      draftLayerIdsRef.current.delete(lid);
+    }
+    try { if (m.getSource(`${id}-src`)) m.removeSource(`${id}-src`); } catch {}
+    draftMetaRef.current.delete(id);
+  };
+
+  const addDraftLayer = (m, draft, id, family, st) => {
+    const color = String(st.color || 令牌色("map-draft-pending"));
+    const opacity = Number.isFinite(Number(st.opacity)) ? Math.min(1, Math.max(0, Number(st.opacity))) : 0.85;
+    const width = Number.isFinite(Number(st.width)) ? Math.max(0.2, Math.min(20, Number(st.width))) : 2.2;
+    const radius = Number.isFinite(Number(st.radius)) ? Math.max(1, Math.min(40, Number(st.radius))) : 6;
+    const fillOpacity = Number.isFinite(Number(st.fillOpacity)) ? Math.min(1, Math.max(0, Number(st.fillOpacity))) : 0.18;
+    const stroke = String(st.stroke || 令牌色("map-draft-stroke") || 补充色.圆点描边);
+    const dashed = st.dashed !== false;
+    const visible = draft.visible !== false;
+    m.addSource(`${id}-src`, { type: "geojson", data: draft.geojson });
+    draftLayerIdsRef.current.add(id);
+    if (family === "line" || family === "LineString" || family === "MultiLineString") {
+      m.addLayer({ id, type: "line", source: `${id}-src`, layout: { visibility: visible ? "visible" : "none" },
+        paint: { "line-color": color, "line-width": width, "line-opacity": opacity, ...(dashed ? { "line-dasharray": [2, 1] } : {}) } });
+    } else if (family === "polygon" || family === "Polygon" || family === "MultiPolygon") {
+      m.addLayer({ id, type: "fill", source: `${id}-src`, layout: { visibility: visible ? "visible" : "none" },
+        paint: { "fill-color": color, "fill-opacity": fillOpacity } });
+      m.addLayer({ id: `${id}-line`, type: "line", source: `${id}-src`, layout: { visibility: visible ? "visible" : "none" },
+        paint: { "line-color": color, "line-width": width * 0.7, "line-opacity": Math.min(1, opacity + 0.1), ...(dashed ? { "line-dasharray": [2, 1] } : {}) } });
+      draftLayerIdsRef.current.add(`${id}-line`);
+    } else {
+      m.addLayer({ id, type: "circle", source: `${id}-src`, layout: { visibility: visible ? "visible" : "none" },
+        paint: { "circle-radius": radius, "circle-color": color, "circle-opacity": opacity, "circle-stroke-color": stroke, "circle-stroke-width": 1.5 } });
+    }
+    draftMetaRef.current.set(id, { sig: null, visible }); // sig 由调用方回填
+  };
+
+  const setDraftVisibility = (m, id, visible) => {
+    for (const lid of [id, `${id}-line`]) {
+      try { if (m.getLayer(lid)) m.setLayoutProperty(lid, "visibility", visible ? "visible" : "none"); } catch {}
+    }
+  };
+
+  const clearDraftLayers = useCallback((map) => {
+    const m = map || mapRef.current;
+    if (!m) return;
+    for (const id of [...draftMetaRef.current.keys()]) removeDraftById(m, id);
+    for (const id of draftLayerIdsRef.current) {
+      try { if (m.getLayer(id)) m.removeLayer(id); } catch {}
+      try { if (m.getSource(id)) m.removeSource(id); } catch {}
+      try { if (m.getSource(`${id}-src`)) m.removeSource(`${id}-src`); } catch {}
+    }
+    draftLayerIdsRef.current.clear();
+    draftMetaRef.current.clear();
+  }, []);
+
+  const showDraftLayers = useCallback((map, drafts = []) => {
+    // 先记录列表：地图可能尚未完成 style 加载，等 markReady/applyStyle 时再重放（记账窗口）。
+    draftListRef.current = Array.isArray(drafts) ? drafts : [];
+    const m = map || mapRef.current;
+    if (!m || !m.isStyleLoaded?.()) return false;
+    const list = draftListRef.current;
+    const wanted = new Set(list.map((d) => draftSlug(d?.id)));
+    // 移除已消失的草稿（按 meta 而非 layerIds 全集，避免误删同前缀其它层）。
+    for (const id of [...draftMetaRef.current.keys()]) {
+      if (!wanted.has(id)) removeDraftById(m, id);
+    }
+    const issues = [];
+    for (const draft of list) {
+      if (!draft?.geojson) continue;
+      const id = draftSlug(draft.id);
+      const family = draft.geometryType || draft.geojson.features?.[0]?.geometry?.type || "point";
+      const visible = draft.visible !== false;
+      // 内容签名：revision/样式/几何族/要素数任一变化才重建；仅显隐走 layout 更新。
+      const sig = JSON.stringify({ r: draft.revision ?? null, s: draft.style || {}, g: family, n: draft.geojson.features?.length ?? 0 });
+      const meta = draftMetaRef.current.get(id);
+      try {
+        if (meta && meta.sig === sig && (m.getLayer(id) || m.getSource(`${id}-src`))) {
+          if (meta.visible !== visible) { setDraftVisibility(m, id, visible); meta.visible = visible; }
+          continue;
+        }
+        // meta 说已渲染但图层缺失（setStyle 清层后重放）→ 按"需重建"处理。
+        if (meta) removeDraftById(m, id);
+        addDraftLayer(m, draft, id, family, draft.style && typeof draft.style === "object" ? draft.style : {});
+        draftMetaRef.current.get(id).sig = sig;
+        draftMetaRef.current.get(id).visible = visible;
+      } catch (error) {
+        issues.push(draft.name || id);
+        try { removeDraftById(m, id); } catch { /* 尽力清理 */ }
+      }
+    }
+    // 渲染失败不静默（方案 C5）：上报可读警告，不中断其余草稿。
+    if (issues.length && onRenderIssueRef.current) {
+      try { onRenderIssueRef.current(`草稿渲染失败：${issues.join("、")}（几何可能无效，已跳过）`); } catch {}
+    }
+    return true;
+  }, [clearDraftLayers]);
+
+  // 草稿层随 props 同步渲染：MapPanel 在 MapViewer 懒加载完成前可能已经拿到草稿列表，
+  // 因此不能只依赖命令式 showDrafts；这里按 id/可见性/版本签名变化重放，并在样式就绪前短重试。
+  const draftSignatureRef = useRef("");
+  const draftRenderedRef = useRef(false);
+  useEffect(() => {
+    const list = Array.isArray(drafts) ? drafts : [];
+    const signature = JSON.stringify(list.map((d) => ({ id: d.id, v: d.visible !== false, r: d.revision, s: d.style || {} })));
+    if (signature === draftSignatureRef.current && draftRenderedRef.current) return;
+    draftSignatureRef.current = signature;
+    if (!loaded) return;
+    let cancelled = false;
+    let tries = 0;
+    let timer = null;
+    const attempt = () => {
+      if (cancelled) return;
+      const ok = showDraftLayers(mapRef.current, list);
+      draftRenderedRef.current = ok === true;
+      if (!ok && tries < 12) {
+        tries += 1;
+        timer = window.setTimeout(attempt, 300);
+      }
+    };
+    attempt();
+    return () => {
+      cancelled = true;
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [loaded, drafts, showDraftLayers]);
+
+  // 主题切换重应用（方案 2026-11-18-002 E1/E2）：MapLibre paint 不支持 CSS var()，
+  // JS 设值的图层色（草稿/分析/绘制等）在 <html data-theme> 变化后需重取令牌并重画；
+  // 底图联动（P2E）：carto 浅/暗成对底图随主题互换（light→positron / dark→dark matter），
+  // 高德等其它底图不强制切换。运行时图层会被 setStyle 清除——主题重应用走重放，不走增量。
+  const CARTO_BASEMAP_PAIR = { "carto-positron": "carto-dark", "carto-dark": "carto-positron" };
+  const themeRef = useRef(当前主题());
+  useEffect(() => {
+    return 订阅主题变更((主题) => {
+      if (主题 === themeRef.current) return;
+      themeRef.current = 主题;
+      const map = mapRef.current;
+      if (!map || !map.isStyleLoaded?.() || !loaded) return;
+      try {
+        clearDraftLayers(map);
+        showDraftLayers(map, draftListRef.current);
+      } catch { /* 主题重应用失败不影响地图主功能 */ }
+      try { replayTemporaryLayers(map); } catch { /* 临时层重放失败按注册表约定自兜底 */ }
+      // 底图深浅联动：仅当当前底图属于 carto 成对组合时互换。
+      try {
+        const target = CARTO_BASEMAP_PAIR[basemapRef.current];
+        if (target && basemapIdsRef.current.includes(target)) {
+          basemapRef.current = target;
+          const selected = setBasemapVisibility(map, basemapIdsRef.current, target);
+          publishBasemap(selected);
+        }
+      } catch { /* 底图联动失败保持原底图 */ }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, clearDraftLayers, showDraftLayers]);
+
+  const showAnalysisLayer = (map, payload = {}, options = {}) => {
+    if (!map || !payload.geojson || !map.isStyleLoaded?.()) return false;
+    const id = String(payload.id || "agent-analysis").replace(/[^a-zA-Z0-9_-]/g, "-");
+    const source = `${id}-source`;
+    const type = payload.type || payload.analysis || "heatmap";
+    const previous = analysisPayloadsRef.current.get(id);
+    if (options.recordHistory !== false && previous && previous !== payload) {
+      const history = analysisHistoryRef.current.get(id) || [];
+      history.push(previous);
+      analysisHistoryRef.current.set(id, history.slice(-5));
+    }
+    const sameKind = analysisKindsRef.current.get(id) === type && !!map.getSource(source);
+    if (!sameKind) removeAnalysisLayers(map, id);
+    const geoSource = map.getSource(source);
+    if (geoSource?.setData) geoSource.setData(payload.geojson);
+    else map.addSource(source, { type: "geojson", data: payload.geojson });
+    // G1：面状空间分析（缓冲区/筛选/裁剪）用 fill+line 渲染，不能落进热力图分支
+    const polygonalAnalysis = type === "buffer" || type === "spatial_filter" || type === "bbox_clip";
+    if (!sameKind && polygonalAnalysis) {
+      map.addLayer({ id: `${id}-fill`, type: "fill", source, paint: { "fill-color": ["coalesce", ["get", "color"], 令牌色("map-draw-accent")], "fill-opacity": 0.22 } });
+      map.addLayer({ id: `${id}-line`, type: "line", source, paint: { "line-color": ["coalesce", ["get", "color"], 补充色.分析描边深], "line-width": 1.8, "line-opacity": 0.9 } });
+    } else if (!sameKind && type === "isochrone") {
+      map.addLayer({ id: `${id}-fill`, type: "fill", source, paint: { "fill-color": ["coalesce", ["get", "color"], 令牌色("map-analysis")], "fill-opacity": 0.2 } });
+      map.addLayer({ id: `${id}-line`, type: "line", source, paint: { "line-color": ["coalesce", ["get", "color"], 令牌色("map-analysis-edge")], "line-width": 2, "line-opacity": 0.9 } });
+      map.addLayer({ id: `${id}-labels`, type: "symbol", source, layout: { "text-field": ["concat", ["to-string", ["get", "range"]], " 分钟"], "text-size": 11, "text-anchor": "center", "text-allow-overlap": false }, paint: { "text-color": 补充色.等时圈标注, "text-halo-color": 令牌色("map-label-halo"), "text-halo-width": 1.2 } });
+    } else if (!sameKind && type !== "isochrone") {
+      const max = Math.max(1, ...(payload.geojson.features || []).map((f) => Number(f.properties?.value ?? f.properties?.flow ?? 1)).filter(Number.isFinite));
+      map.addLayer({
+        id: `${id}-heat`, type: "heatmap", source,
+        maxzoom: 14,
+        paint: {
+          "heatmap-weight": ["interpolate", ["linear"], ["coalesce", ["get", "value"], ["get", "flow"], 1], 0, 0, max, 1],
+          "heatmap-intensity": ["interpolate", ["linear"], ["zoom"], 5, 0.8, 12, 1.6],
+          "heatmap-radius": ["interpolate", ["linear"], ["zoom"], 5, 14, 12, 30],
+          "heatmap-opacity": 0.76,
+          "heatmap-color": 色阶插值表达式("sequential.heat-flow", ["heatmap-density"]),
+        },
+      });
+      map.addLayer({
+        id: `${id}-circles`, type: "circle", source, minzoom: 10,
+        paint: { "circle-radius": ["interpolate", ["linear"], ["coalesce", ["get", "value"], ["get", "flow"], 1], 0, 3, max, 10], "circle-color": 令牌色("map-draw-accent"), "circle-opacity": 0.72, "circle-stroke-color": 补充色.圆点描边, "circle-stroke-width": 1 },
+      });
+      map.addLayer({
+        id: `${id}-labels`, type: "symbol", source, minzoom: 12,
+        layout: { "text-field": ["coalesce", ["get", "name"], ""], "text-size": 11, "text-offset": [0, 1.2], "text-anchor": "top", "text-allow-overlap": false },
+        paint: { "text-color": 令牌色("map-label-ink"), "text-halo-color": 令牌色("map-label-halo"), "text-halo-width": 1.2 },
+      });
+    }
+    if (type === "od" && payload.lines) {
+      const lineSource = `${id}-lines-source`;
+      const lineGeoSource = map.getSource(lineSource);
+      if (lineGeoSource?.setData) lineGeoSource.setData(payload.lines);
+      else {
+        map.addSource(lineSource, { type: "geojson", data: payload.lines });
+        map.addLayer({
+          id: `${id}-od-lines`, type: "line", source: lineSource,
+          paint: {
+            "line-color": 令牌色("map-analysis-edge"),
+            "line-width": ["interpolate", ["linear"], ["get", "flow"], 1, 0.7, 10, 2.2, 40, 4.5],
+            "line-opacity": 0.5,
+          },
+        });
+      }
+    }
+    analysisIdsRef.current.add(id);
+    analysisPayloadsRef.current.set(id, payload);
+    analysisKindsRef.current.set(id, type);
+    const b = geometryBounds(payload.geojson);
+    if (payload.fitBounds && b) map.fitBounds([[b[0], b[1]], [b[2], b[3]]], { padding: 60, maxZoom: 14, duration: 600 });
+    return true;
+  };
+
+  // 初始化地图
+  useEffect(() => {
+    if (!containerRef.current) return undefined;
+    regionFieldCacheRef.current.clear();
+    setLoaded(false);
+    setLoadError("");
+  const map = new MapLibreMap({
+      container: containerRef.current,
+      style: STYLE_PATH(project),
+      center: initialView?.center || config?.center || [120.0, 29.2],
+      zoom: initialView?.zoom || config?.zoom || 7,
+      // MapLibre 5.x 通过 canvasContextAttributes 保留 WebGL 绘制缓冲，供导出读回。
+      canvasContextAttributes: { preserveDrawingBuffer: true },
+      attributionControl: { compact: true },
+    });
+    mapRef.current = map;
+    // 测试/调试钩子：把当前地图实例挂到 window，供自动化断言读取"画面上真实存在的图层"。
+    // 只读用途；不参与业务逻辑，也不影响生产行为（仅一个引用）。
+    try { window.__oawMap = map; } catch {}
+    map.addControl(new NavigationControl({ visualizePitch: true }), "bottom-right");
+    map.addControl(new ScaleControl({ maxWidth: 120, unit: "metric" }), "bottom-left");
+    let ready = false;
+    let fallbackTimer;
+    const markReady = () => {
+      if (ready || mapRef.current !== map) return;
+      ready = true;
+      window.clearTimeout(fallbackTimer);
+      setLoadError("");
+      setLoaded(true);
+      try { onReadyRef.current?.(); } catch {} // 就绪通知：上层消费待处理队列（方案 2026-11-18-002 C4）
+      ensureRuntimeLayers(map);
+      // 首屏恢复草稿层（可能早于地图就绪加载）。
+      if (draftListRef.current.length) showDraftLayers(map, draftListRef.current);
+      ensureBoundaryLabelSources(map).then(() => {
+        ensureRuntimeLayers(map);
+        if (drillRef.current) applyDrillState(map, drillRef.current);
+      }).catch(() => {});
+      // 立即同步图层列表（避免加载后第一时间下钻时 ref 为空）
+      fetch(STYLE_PATH(project))
+        .then((r) => r.text())
+        .then((text) => {
+          styleHashRef.current = styleHash(text);
+          const s = JSON.parse(text);
+          syncLayerRefs(s);
+          const selected = setBasemapVisibility(map, basemapIdsRef.current, basemapRef.current);
+          publishBasemap(selected);
+        })
+        .catch(() => {});
+    };
+    map.on("error", (event) => {
+      const detail = event?.error?.message || event?.error?.statusText || String(event?.error || "地图资源加载失败");
+      console.error("[MapLibre]", detail);
+    });
+    // 从 style 提取底图/路网图层 id（下钻过滤与底图切换用）
+    const syncLayerRefs = (s) => {
+      if (!s?.layers) return;
+      const ids = s.layers
+        .filter((l) => String(l.id).startsWith("basemap-"))
+        .map((l) => String(l.id).slice("basemap-".length));
+      if (ids.length) basemapIdsRef.current = ids;
+      roadLayerIdsRef.current = s.layers
+        .filter((l) => l.source && !["boundary-city", "boundary-county"].includes(l.source)
+          && (l.type === "line" || l.type === "circle" || (l.type === "symbol" && String(l.id).endsWith("-label"))))
+        .map((l) => l.id);
+    };
+    map.on("load", () => {
+      markReady();
+    });
+    map.on("styledata", () => {
+      // styledata 比 load 更早到达，先让界面解除遮罩；瓦片继续异步加载。
+      if (map.getStyle?.()?.layers?.length) markReady();
+    });
+    // 样式主体已经可用时，个别字体/瓦片请求失败不应阻塞整个地图界面。
+    map.once("idle", () => {
+      if (map.isStyleLoaded?.()) markReady();
+    });
+    // 最后的兜底：避免第三方底图或字体服务异常导致“地图加载中”永久遮罩。
+    fallbackTimer = window.setTimeout(() => {
+      if (mapRef.current !== map || ready) return;
+      if (map.isStyleLoaded?.() || map.loaded?.() || map.getStyle?.()?.layers?.length) markReady();
+      else setLoadError("地图样式加载失败，请重试");
+    }, 10000);
+    // 读取当前真实相机。会话视口（initialView）已在建图参数里应用，
+    // 因此首次 publishViewport 上报的就是“应用后的相机”，不是默认相机。
+    const readViewport = () => {
+      const center = map.getCenter();
+      const bounds = map.getBounds();
+      return {
+        // project 随视口一起上报：上层合并会话上下文时不能丢地图项目。
+        project,
+        center: [Number(center.lng.toFixed(6)), Number(center.lat.toFixed(6))],
+        zoom: Number(map.getZoom().toFixed(3)),
+        bounds: [
+          Number(bounds.getWest().toFixed(6)),
+          Number(bounds.getSouth().toFixed(6)),
+          Number(bounds.getEast().toFixed(6)),
+          Number(bounds.getNorth().toFixed(6)),
+        ],
+      };
+    };
+    const publishViewport = () => {
+      // 同步缓存最后一次真实视口：去抖窗口内组件卸载/关闭时由卸载清理补报，
+      // 否则“最后一次移动”只存在定时器里会直接丢失。
+      try { lastViewportRef.current = readViewport(); } catch {}
+      if (viewportTimerRef.current) window.clearTimeout(viewportTimerRef.current);
+      viewportTimerRef.current = window.setTimeout(() => {
+        if (mapRef.current !== map || !viewportCallbackRef.current) return;
+        // 预览只读：不把轻量小地图的相机写回会话 header。
+        if (readOnlyRef.current) return;
+        const pending = lastViewportRef.current;
+        if (!pending) return;
+        try {
+          viewportCallbackRef.current({
+            // project 随视口一起上报：上层合并会话上下文时不能丢地图项目。
+            project,
+            center: pending.center,
+            zoom: pending.zoom,
+            bounds: pending.bounds,
+            updatedAt: Date.now(),
+          });
+        } catch {}
+      }, 700);
+    };
+    map.on("move", () => {
+      const c = map.getCenter();
+      setCursor({ lng: c.lng.toFixed(5), lat: c.lat.toFixed(5), zoom: map.getZoom().toFixed(2) });
+    });
+    map.on("moveend", publishViewport);
+    publishViewport();
+    // 三栏可拖动：容器尺寸变化时 MapLibre 不会自动重算画布，必须显式 resize，
+    // 否则会留下黑边或拉伸错位。防抖避免拖动过程中每帧重建 WebGL 缓冲。
+    let resizeTimer;
+    const resizeObserver = typeof ResizeObserver !== "undefined"
+      ? new ResizeObserver(() => {
+        if (resizeTimer) window.clearTimeout(resizeTimer);
+        resizeTimer = window.setTimeout(() => {
+          if (mapRef.current !== map) return;
+          try { map.resize(); } catch {}
+        }, 80);
+      })
+      : null;
+    resizeObserver?.observe(containerRef.current);
+    return () => {
+      resizeObserver?.disconnect();
+      if (resizeTimer) window.clearTimeout(resizeTimer);
+      try { clearLayerRegistry(mapRef.current || map); } catch {}
+      try { if (window.__oawMap === map) window.__oawMap = null; } catch {}
+      try { map.remove(); } catch {}
+      window.clearTimeout(fallbackTimer);
+      if (viewportTimerRef.current) window.clearTimeout(viewportTimerRef.current);
+      mapRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project, retryToken]);
+
+  // 卸载清理：把仍在去抖窗口里的最后一次真实视口补报一次。
+  // 只在组件真正卸载时执行（项目切换会重建地图实例，但不会卸载组件），
+  // 因此不会把旧项目的相机写到新项目上；只读预览不上报。
+  useEffect(() => () => {
+    if (readOnlyRef.current) return;
+    const pending = lastViewportRef.current;
+    const callback = viewportCallbackRef.current;
+    if (!pending || !callback) return;
+    if (String(pending.project || "") !== String(projectRef.current || "")) return;
+    try { callback({ ...pending, updatedAt: Date.now() }); } catch {}
+  }, []);
+
+  // 项目配置加载/切换后同步底图；配置是持久化选择的唯一来源，避免热更新时回到样式文件中的旧默认值。
+  useEffect(() => {
+    if (!config?.basemap) return;
+    const desired = normalizeBasemap(config.basemap);
+    basemapRef.current = desired;
+    if (loaded && mapRef.current) {
+      const selected = setBasemapVisibility(mapRef.current, basemapIdsRef.current, desired);
+      publishBasemap(selected);
+    } else setBasemap(desired);
+  }, [config?.basemap, loaded]);
+
+  // 点击要素弹窗
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !loaded) return undefined;
+    const popup = new Popup({ closeButton: true, closeOnClick: false, maxWidth: "300px" });
+    const onClick = (e) => {
+      if (readOnly) return; // 只读小地图：不弹属性窗、不触发下钻
+      if (drawModeRef.current) return; // 绘制/选点模式：不弹要素
+      if (!popupEnabledRef.current) return; // 绘制/测量模式下不弹属性窗
+      const feats = map.queryRenderedFeatures(e.point, {});
+      const pick = feats.find(
+        (f) => f.layer && !f.layer.id.startsWith("basemap") && f.properties && Object.keys(f.properties).length
+      );
+      if (!pick) return;
+      // 点击行政区划边界 → 触发下钻（市级/县区级）
+      const boundaryLayer = String(pick.layer.id).replace(/-label$/, "");
+      if (boundaryLayer === "boundary-city" || boundaryLayer === "boundary-county") {
+        const p = pick.properties;
+        const code = String(p.adcode ?? "");
+        if (code) {
+          onDrillDown?.({
+            source: boundaryLayer,
+            code,
+            name: p.name || code,
+            level: boundaryLayer === "boundary-city" ? "city" : "county",
+          });
+        }
+      }
+      const p = pick.properties;
+      const rows = Object.entries(p)
+        .filter(([, v]) => v !== "" && v !== null && v !== undefined)
+        .map(([k, v]) => `<tr><td class="mp-pop-key">${k}</td><td>${v}</td></tr>`)
+        .join("");
+      popup.setLngLat(e.lngLat).setHTML(`<table class="mp-pop">${rows}</table>`).addTo(map);
+    };
+    map.on("click", onClick);
+    const move = () => popup.remove();
+    map.on("move", move);
+    return () => {
+      map.off("click", onClick);
+      map.off("move", move);
+      try { popup.remove(); } catch {}
+    };
+  }, [loaded, readOnly]);
+
+  // 轮询 style.json + map.config.json，感知 agent 修改（file_changed 后由上层触发立即刷新）
+  useEffect(() => {
+    // 只读小地图不轮询 style：避免为卡片持续请求样式并反复 setStyle。
+    if (!loaded || readOnly) return undefined;
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch(STYLE_PATH(project));
+        const text = await res.text();
+        const hash = styleHash(text);
+        if (hash !== styleHashRef.current) {
+          styleHashRef.current = hash;
+          applyStyle(JSON.parse(text));
+        }
+      } catch {}
+    }, 3000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, project, readOnly]);
+
+  // 应用样式（保留相机 + 重放客户端图层状态）
+  const applyStyle = useCallback((style) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const camera = map.getCenter();
+    const zoom = map.getZoom();
+    try { map.setStyle(style, { diff: false }); } catch {}
+    map.jumpTo({ center: camera, zoom });
+    // 记录 style 中实际存在的底图图层（服务端按 Key 配置动态生成）
+    const ids = (style?.layers || [])
+      .filter((l) => String(l.id).startsWith("basemap-"))
+      .map((l) => String(l.id).slice("basemap-".length));
+    if (ids.length) basemapIdsRef.current = ids;
+    // 记录路网图层（下钻过滤目标）
+    roadLayerIdsRef.current = (style?.layers || [])
+      .filter((l) => l.source && !["boundary-city", "boundary-county"].includes(l.source)
+        && (l.type === "line" || l.type === "circle" || (l.type === "symbol" && String(l.id).endsWith("-label"))))
+      .map((l) => l.id);
+    // 重放下钻状态（style 重载后恢复过滤与高亮；setStyle 异步，需等 style 渲染完成）
+    if (drillRef.current) {
+      const d = drillRef.current;
+      const restoreDrill = () => {
+        const m = mapRef.current;
+        if (!m || !drillRef.current) return;
+        applyDrillState(m, d);
+      };
+      map.once("idle", restoreDrill);
+      // 兜底：idle 若长时间不触发（无交互时不触发？MapLibre idle 在渲染稳定后触发）
+      setTimeout(() => {
+        if (drillRef.current && mapRef.current) restoreDrill();
+      }, 1500);
+    }
+    // 重放底图。setStyle 是异步的，必须等新样式的图层注册完成后再设置显隐，
+    // 否则用户选择会被旧样式/默认可见图层覆盖。
+    const desired = basemapRef.current || normalizeBasemap(config?.basemap);
+    const restoreBasemap = () => {
+      const selected = setBasemapVisibility(map, basemapIdsRef.current, desired);
+      publishBasemap(selected);
+    };
+    if (map.isStyleLoaded?.()) restoreBasemap();
+    else map.once("idle", restoreBasemap);
+    setTimeout(restoreBasemap, 800);
+    ensureRuntimeLayers(map);
+    ensureBoundaryLabelSources(map).then(() => {
+      ensureRuntimeLayers(map);
+      if (drillRef.current) applyDrillState(map, drillRef.current);
+    }).catch(() => {});
+    map.once("idle", () => {
+      ensureRuntimeLayers(map);
+      ensureBoundaryLabelSources(map).then(() => {
+        ensureRuntimeLayers(map);
+        if (drillRef.current) applyDrillState(map, drillRef.current);
+      }).catch(() => {});
+      const payloads = [...analysisPayloadsRef.current.values()];
+      payloads.forEach((payload) => showAnalysisLayer(map, payload));
+      // 重放注册在图层注册表里的其它临时层（OD / 等时圈 / 路径 / 测量绘制）。
+      // setStyle 会把它们一并清掉，这里统一画回来，避免"改个样式颜色，分析结果就没了"。
+      replayTemporaryLayers(map);
+      // 草稿层同样在样式重载后重放（草稿只在运行时渲染，不写 style.json）。
+      if (draftListRef.current.length) showDraftLayers(map, draftListRef.current);
+    });
+  }, []);
+
+  /** 热更新：agent 修改 style.json 后调用；保留相机，不重挂地图。 */
+  const reloadStyleNow = useCallback(async () => {
+    try {
+      const res = await fetch(STYLE_PATH(project));
+      const text = await res.text();
+      styleHashRef.current = styleHash(text);
+      const style = JSON.parse(text);
+      applyStyle(style);
+      return true;
+    } catch { return false; }
+  }, [applyStyle, project]);
+  // 只读小地图不轮询 style，但地图正式文件变更时仍需显式热更新：
+  // reloadToken 由上层（App → MiniMapPreview/MapPanel）递增，避免整块地图重挂。
+  const appliedReloadTokenRef = useRef(reloadToken);
+  useEffect(() => {
+    if (!loaded || !reloadToken) return;
+    if (appliedReloadTokenRef.current === reloadToken) return;
+    appliedReloadTokenRef.current = reloadToken;
+    void reloadStyleNow();
+  }, [loaded, reloadToken, reloadStyleNow]);
+
+  // 外部命令（MapPanel 调用）
+  useImperativeHandle(ref, () => ({
+    getMap: () => mapRef.current,
+    getViewport: () => {
+      const map = mapRef.current;
+      if (!map) return null;
+      const c = map.getCenter();
+      const b = map.getBounds();
+      return { center: [c.lng, c.lat], zoom: map.getZoom(), bounds: [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()] };
+    },
+    /** 热更新：agent 修改 style.json 后调用 */
+    reloadStyle: reloadStyleNow,
+    /** 持久化样式后只更新轮询游标，不触发一次完整的 MapLibre setStyle。 */
+    syncStyleHash: async () => {
+      try {
+        const res = await fetch(STYLE_PATH(project));
+        styleHashRef.current = styleHash(await res.text());
+        return true;
+      } catch { return false; }
+    },
+    setBasemap: (id) => {
+      const map = mapRef.current;
+      const desired = normalizeBasemap(id);
+      basemapRef.current = desired;
+      if (map) {
+        const selected = setBasemapVisibility(map, basemapIdsRef.current, desired);
+        publishBasemap(selected);
+      } else setBasemap(desired);
+    },
+    setProjection: (type = "mercator") => {
+      const map = mapRef.current;
+      if (!map?.setProjection) return false;
+      try {
+        map.setProjection({ type: type === "globe" ? "globe" : "mercator" });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    /** 设置下钻后的道路/设施范围。 */
+    setCoverageMode: (mode = "region") => {
+      coverageModeRef.current = ["region", "city", "province"].includes(mode) ? mode : "region";
+      const map = mapRef.current;
+      if (map && drillRef.current) applyDrillState(map, drillRef.current);
+      else if (map) for (const id of roadLayerIdsRef.current) if (map.getLayer(id)) map.setFilter(id, null);
+    },
+    /** 省市县下钻：高亮区域 + 按 adcode/city_code 过滤路网 */
+    drillTo: (d) => {
+      const map = mapRef.current;
+      if (!map || !d?.code) return;
+      drillRef.current = d;
+      if (!applyDrillState(map, d)) map.once("idle", () => applyDrillState(map, d));
+      window.setTimeout(() => {
+        if (mapRef.current === map && drillRef.current?.code === d.code) applyDrillState(map, d);
+      }, 320);
+    },
+    /** 清除下钻 */
+    clearDrill: () => {
+      const map = mapRef.current;
+      if (!map) return;
+      clearRegionHighlight(map);
+      for (const id of roadLayerIdsRef.current) {
+        if (map.getLayer(id)) map.setFilter(id, null);
+      }
+      for (const id of ["boundary-city", "boundary-county"]) {
+        if (map.getLayer(id)) map.setFilter(id, null);
+      }
+      for (const id of runtimeLabelLayers) {
+        if (map.getLayer(id)) map.setFilter(id, null);
+      }
+      drillRef.current = null;
+    },
+    /** 区域选择器定位到边界范围，不改变当前样式。 */
+    focusBounds: (bbox, options = {}) => {
+      const map = mapRef.current;
+      if (!map || !Array.isArray(bbox) || bbox.length !== 4) return;
+      try {
+        map.fitBounds([[bbox[0], bbox[1]], [bbox[2], bbox[3]]], { padding: options.padding || 56, maxZoom: options.maxZoom || 13, duration: options.duration ?? 280 });
+      } catch {}
+    },
+    /** 标注总开关：只改运行时 symbol 图层。 */
+    setAnnotationVisibility: (visible) => {
+      labelsVisibleRef.current = !!visible;
+      const map = mapRef.current;
+      if (!map) return;
+      ensureRuntimeLayers(map);
+      const labelIds = new Set([
+        ...runtimeLabelLayers,
+        ...(map.getStyle()?.layers || []).filter((l) => String(l.id).endsWith("-label")).map((l) => l.id),
+      ]);
+      for (const id of labelIds) {
+        if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visible ? "visible" : "none");
+      }
+    },
+    /** Agent 或仪表盘生成的分析结果：只更新临时图层，不重载完整 style。 */
+    showAnalysis: (payload) => showAnalysisLayer(mapRef.current, payload),
+    /** 草稿层：渲染/刷新全部待确认草稿（点/线/面），不写 style.json。 */
+    showDrafts: (drafts = []) => showDraftLayers(mapRef.current, drafts),
+    clearDrafts: () => { draftListRef.current = []; clearDraftLayers(mapRef.current); },
+    clearAnalysis: (id = "agent-analysis") => removeAnalysisLayers(mapRef.current, id),
+    clearAllAnalysis: () => [...analysisIdsRef.current].forEach((id) => removeAnalysisLayers(mapRef.current, id)),
+    undoAnalysis: (id = "agent-analysis") => {
+      const history = analysisHistoryRef.current.get(id) || [];
+      const previous = history.pop();
+      analysisHistoryRef.current.set(id, history);
+      if (previous) return showAnalysisLayer(mapRef.current, previous, { recordHistory: false });
+      removeAnalysisLayers(mapRef.current, id);
+      return false;
+    },
+    /** 绘制/测量模式：开关属性弹窗与光标 */
+    setDrawingMode: (on) => {
+      popupEnabledRef.current = !on;
+      const map = mapRef.current;
+      if (map) map.getCanvas().style.cursor = on ? "crosshair" : "";
+    },
+    setLayerVisibility: (id, visible) => {
+      const map = mapRef.current;
+      if (!map) return;
+      const layers = map.getStyle()?.layers || [];
+      const related = layers.filter((layer) => (
+        layer.id === id
+        || (!id.endsWith("-label") && (
+          layer.source === id || layer.id.startsWith(`${id}-`)
+        ))
+      ));
+      for (const layer of related) {
+        if (map.getLayer(layer.id)) {
+          map.setLayoutProperty(layer.id, "visibility", visible ? "visible" : "none");
+        }
+      }
+    },
+    setLayerOpacity: (id, opacity) => {
+      const map = mapRef.current;
+      if (!map || !map.getLayer(id)) return;
+      const paintProp = ["line-opacity", "circle-opacity", "fill-opacity"].find((p) => map.getPaintProperty(id, p) !== undefined);
+      if (paintProp) map.setPaintProperty(id, paintProp, opacity);
+    },
+    moveLayer: (id, dir) => {
+      const map = mapRef.current;
+      if (!map || !map.getLayer(id)) return;
+      const ids = map.getStyle().layers.map((l) => l.id).filter((i) => !i.startsWith("basemap"));
+      const idx = ids.indexOf(id);
+      if (idx === -1) return;
+      const target = dir === "up" ? ids[idx + 1] : ids[idx - 1];
+      if (target) map.moveLayer(id, target);
+    },
+    exportPng: (scale = 1, filename = "map-export.png") => {
+      const map = mapRef.current;
+      if (!map) return;
+      const prev = map.getPixelRatio();
+      map.setPixelRatio(Math.max(1, scale));
+      try {
+        // 等待一帧重绘后截图
+        requestAnimationFrame(() => {
+          const canvas = map.getCanvas();
+          const url = canvas.toDataURL("image/png");
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = filename;
+          a.click();
+        });
+      } finally {
+        setTimeout(() => map.setPixelRatio(prev), 500);
+      }
+    },
+    /** 样式编辑：运行时改 paint 属性（持久化由上层调 mapSaveStyle） */
+    setLayerPaint: (id, key, value) => {
+      const map = mapRef.current;
+      if (!map || !map.getLayer(id)) return;
+      try { map.setPaintProperty(id, key, value); } catch {}
+    },
+    /** 图层定位：fitBounds 到图层数据范围 */
+    zoomToLayer: (id) => {
+      const map = mapRef.current;
+      if (!map) return;
+      try {
+        const src = map.getSource(id);
+        if (!src || typeof src.getData !== "function") return;
+        const fc = src.getData();
+        const b = new LngLatBounds();
+        const walk = (g) => {
+          if (!g) return;
+          if (g.type === "FeatureCollection") g.features.forEach((f) => walk(f.geometry));
+          else if (g.type === "Feature") walk(g.geometry);
+          else if (g.type === "Point") b.extend(g.coordinates);
+          else if (g.type === "MultiPoint" || g.type === "LineString") g.coordinates.forEach((c) => b.extend(c));
+          else if (g.type === "MultiLineString" || g.type === "Polygon") g.coordinates.flat().forEach((c) => b.extend(c));
+          else if (g.type === "MultiPolygon") g.coordinates.flat(2).forEach((c) => b.extend(c));
+        };
+        walk(fc);
+        if (!b.isEmpty()) map.fitBounds(b, { padding: 60, maxZoom: 14 });
+      } catch {}
+    },
+    /** 拖拽排序：移动到指定图层上方 */
+    moveLayerTo: (id, targetId) => {
+      const map = mapRef.current;
+      if (!map || !map.getLayer(id) || id === targetId) return;
+      try { map.moveLayer(id, targetId); } catch {}
+    },
+    /** 等时圈显示：添加/更新 isochrones 面图层 */
+    showIsochrones: (polygons) => {
+      const map = mapRef.current;
+      if (!map) return;
+      const fc = { type: "FeatureCollection", features: (polygons || []).map((ring, i) => ({
+        type: "Feature",
+        properties: { idx: i, color: 补充色.等时圈环[i % 补充色.等时圈环.length] },
+        geometry: { type: "Polygon", coordinates: [ring] },
+      })) };
+      try {
+        if (map.getSource("isochrones")) {
+          map.getSource("isochrones").setData(fc);
+        } else {
+          map.addSource("isochrones", { type: "geojson", data: fc });
+          map.addLayer({
+            id: "isochrones",
+            type: "fill",
+            source: "isochrones",
+            paint: { "fill-color": ["get", "color"], "fill-opacity": 0.25, "fill-outline-color": 令牌色("map-draw-accent") },
+          });
+        }
+        map.fitBounds(new LngLatBounds().extend([[118.5, 28.0], [122.5, 31.5]]), { padding: 40 });
+      } catch {}
+    },
+    clearIsochrones: () => {
+      const map = mapRef.current;
+      if (!map) return;
+      try {
+        if (map.getLayer("isochrones")) map.removeLayer("isochrones");
+        if (map.getSource("isochrones")) map.removeSource("isochrones");
+      } catch {}
+    },
+    /** 分析结果局部更新：热力、OD 期望线、等时圈均不重载完整样式。 */
+    showAnalysisRich: (action = {}) => {
+      const map = mapRef.current;
+      if (!map || !map.isStyleLoaded?.()) return false;
+      const rawId = String(action.id || "analysis").replace(/[^a-zA-Z0-9_-]/g, "-");
+      const base = `analysis-${rawId || "result"}`;
+      const data = action.geojson?.type === "FeatureCollection" ? action.geojson : { type: "FeatureCollection", features: [] };
+      const linesData = action.lines?.type === "FeatureCollection" ? action.lines : null;
+      const ensureGeoSource = (id, fc) => {
+        const src = map.getSource(id);
+        if (src && typeof src.setData === "function") { src.setData(fc); return; }
+        map.addSource(id, { type: "geojson", data: fc });
+      };
+      const ensureLayer = (id, spec) => { if (!map.getLayer(id)) map.addLayer({ id, ...spec }); };
+      try {
+        const firstGeometry = data.features?.[0]?.geometry?.type || "";
+        const polygon = action.analysis === "isochrone" || firstGeometry === "Polygon" || firstGeometry === "MultiPolygon";
+        const points = data.features?.some((f) => ["Point", "MultiPoint"].includes(f.geometry?.type));
+        const opts = action.options || {};
+        const radius = Number.isFinite(Number(opts.radius)) ? Number(opts.radius) : null;
+        const opacity = Number.isFinite(Number(opts.opacity)) ? Number(opts.opacity) : 0.72;
+        const intensity = Number.isFinite(Number(opts.intensity)) ? Number(opts.intensity) : 1.15;
+        const weightMax = Number.isFinite(Number(opts.weightMax)) ? Math.max(1, Number(opts.weightMax)) : 800;
+        ensureGeoSource(`${base}-src`, data);
+        if (polygon) {
+          ensureLayer(`${base}-fill`, { type: "fill", source: `${base}-src`, paint: { "fill-color": ["coalesce", ["get", "color"], 令牌色("map-analysis")], "fill-opacity": 0.24, "fill-outline-color": 令牌色("map-analysis-edge") } });
+        } else if (points) {
+          ensureLayer(`${base}-heat`, { type: "heatmap", source: `${base}-src`, paint: {
+            "heatmap-weight": ["interpolate", ["linear"], ["coalesce", ["get", "value"], ["get", "flow"], 1], 0, 0, weightMax, 1],
+            "heatmap-intensity": intensity,
+            "heatmap-radius": radius === null ? ["interpolate", ["linear"], ["zoom"], 5, 14, 12, 34] : radius,
+            "heatmap-opacity": opacity,
+            "heatmap-color": 色阶插值表达式("sequential.heat-flow", ["heatmap-density"]),
+          } });
+          ensureLayer(`${base}-points`, { type: "circle", source: `${base}-src`, minzoom: 10, paint: { "circle-radius": ["interpolate", ["linear"], ["coalesce", ["get", "value"], ["get", "flow"], 1], 0, 3, weightMax, 10], "circle-color": 令牌色("map-draw-accent"), "circle-opacity": opacity, "circle-stroke-color": 补充色.圆点描边, "circle-stroke-width": 1 } });
+        }
+        if (linesData) {
+          ensureGeoSource(`${base}-lines-src`, linesData);
+          const flowRamp = 色阶词汇表["sequential.heat-flow"].线变体;
+          ensureLayer(`${base}-lines`, { type: "line", source: `${base}-lines-src`, paint: { "line-color": ["interpolate", ["linear"], ["coalesce", ["get", "flow"], 1], 0, flowRamp[0], 400, flowRamp[1], 800, flowRamp[2]], "line-width": ["interpolate", ["linear"], ["coalesce", ["get", "flow"], 1], 0, 1, 800, 4], "line-opacity": 0.65 } });
+        }
+        if (action.fitBounds) {
+          const coords = [];
+          const walk = (g) => { if (!g) return; if (g.type === "FeatureCollection") return g.features?.forEach((f) => walk(f.geometry)); if (g.type === "Feature") return walk(g.geometry); if (g.type === "Point") return coords.push(g.coordinates); if (g.coordinates) g.coordinates.forEach((c) => Array.isArray(c?.[0]) ? walk({ type: "LineString", coordinates: c }) : coords.push(c)); };
+          walk(data); if (linesData) walk(linesData);
+          if (coords.length) { const b = new LngLatBounds(); coords.forEach((c) => b.extend(c)); if (!b.isEmpty()) map.fitBounds(b, { padding: 55, maxZoom: 14, duration: 600 }); }
+        }
+        // 登记本次渲染：① clearAllAnalysis 能清掉它（此前只登记旧路径，导致
+        // 浮动条"清除"清不掉可视面板出的图）；② 样式重载后重放，改颜色/切底图
+        // 不会让分析结果消失（阶段 2 验收 C3）。
+        // 重放走 rich 路径本身，保证恢复出来的图层 id 与首次渲染一致（analysis-* 前缀）。
+        analysisIdsRef.current.add(rawId);
+        analysisPayloadsRef.current.set(rawId, action);
+        analysisKindsRef.current.set(rawId, action.type || action.analysis || "heatmap");
+        registerLayerReplay(map, `analysis:${rawId}`, (m) => {
+          const payload = analysisPayloadsRef.current.get(rawId);
+          if (!payload) return;
+          const base = `analysis-${rawId || "result"}`;
+          const restore = (sourceId, layerId, spec) => {
+            const src = m.getSource(sourceId);
+            if (!src && payload.geojson) m.addSource(sourceId, { type: "geojson", data: payload.geojson });
+            if (!m.getLayer(layerId)) m.addLayer({ id: layerId, source: sourceId, ...spec });
+          };
+          try {
+            const data = payload.geojson?.type === "FeatureCollection" ? payload.geojson : { type: "FeatureCollection", features: [] };
+            const first = data.features?.[0]?.geometry?.type || "";
+            const polygon = payload.analysis === "isochrone" || first === "Polygon" || first === "MultiPolygon";
+            const points = data.features?.some((f) => ["Point", "MultiPoint"].includes(f.geometry?.type));
+            if (polygon) {
+              restore(`${base}-src`, `${base}-fill`, { type: "fill", paint: { "fill-color": ["coalesce", ["get", "color"], 令牌色("map-analysis")], "fill-opacity": 0.24, "fill-outline-color": 令牌色("map-analysis-edge") } });
+            } else if (points) {
+              restore(`${base}-src`, `${base}-heat`, { type: "heatmap", paint: { "heatmap-weight": 1, "heatmap-intensity": 1.15, "heatmap-radius": 18, "heatmap-opacity": 0.72 } });
+              restore(`${base}-src`, `${base}-points`, { type: "circle", minzoom: 10, paint: { "circle-radius": 4, "circle-color": 令牌色("map-draw-accent"), "circle-opacity": 0.72, "circle-stroke-color": 补充色.圆点描边, "circle-stroke-width": 1 } });
+            }
+            if (payload.lines?.type === "FeatureCollection") {
+              restore(`${base}-lines-src`, `${base}-lines`, { type: "line", paint: { "line-color": 令牌色("map-analysis-edge"), "line-width": 1.5, "line-opacity": 0.65 } });
+            }
+          } catch { /* 单条重放失败不连累其它临时层 */ }
+        });
+        return true;
+      } catch { return false; }
+    },
+    clearAnalysisRich: (analysisId = "analysis") => {
+      const map = mapRef.current;
+      if (!map) return;
+      const base = `analysis-${String(analysisId).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+      for (const id of [`${base}-fill`, `${base}-heat`, `${base}-points`, `${base}-lines`]) { try { if (map.getLayer(id)) map.removeLayer(id); } catch {} }
+      for (const id of [`${base}-src`, `${base}-lines-src`]) { try { if (map.getSource(id)) map.removeSource(id); } catch {} }
+      // 同步注销登记与重放，否则清除后一次样式重载又把它画回来。
+      const rawId = String(analysisId).replace(/[^a-zA-Z0-9_-]/g, "-");
+      analysisIdsRef.current.delete(rawId);
+      analysisPayloadsRef.current.delete(rawId);
+      analysisKindsRef.current.delete(rawId);
+      try { unregisterLayerReplay(map, `analysis:${rawId}`); } catch {}
+    },
+    /** 临时分析图层显隐，不写入业务 style，关闭弹窗后仍可恢复。 */
+    setAnalysisVisibility: (analysisId = "analysis", visible = true) => {
+      const map = mapRef.current;
+      if (!map) return;
+      const base = `analysis-${String(analysisId).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+      for (const id of [`${base}-fill`, `${base}-heat`, `${base}-points`, `${base}-lines`]) {
+        try { if (map.getLayer(id)) map.setLayoutProperty(id, "visibility", visible ? "visible" : "none"); } catch {}
+      }
+    },
+    /** 调整热力图半径/权重范围/透明度/强度。 */
+    setAnalysisOptions: (analysisId = "analysis", options = {}) => {
+      const map = mapRef.current;
+      if (!map) return;
+      const base = `analysis-${String(analysisId).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+      const heat = `${base}-heat`;
+      const points = `${base}-points`;
+      try {
+        if (map.getLayer(heat)) {
+          if (Number.isFinite(Number(options.radius))) map.setPaintProperty(heat, "heatmap-radius", Number(options.radius));
+          if (Number.isFinite(Number(options.opacity))) map.setPaintProperty(heat, "heatmap-opacity", Number(options.opacity));
+          if (Number.isFinite(Number(options.intensity))) map.setPaintProperty(heat, "heatmap-intensity", Number(options.intensity));
+          if (Number.isFinite(Number(options.weightMax))) {
+            const max = Math.max(1, Number(options.weightMax));
+            map.setPaintProperty(heat, "heatmap-weight", ["interpolate", ["linear"], ["coalesce", ["get", "value"], ["get", "flow"], 1], 0, 0, max, 1]);
+          }
+        }
+        if (map.getLayer(points) && Number.isFinite(Number(options.opacity))) map.setPaintProperty(points, "circle-opacity", Number(options.opacity));
+      } catch {}
+    },
+    /** 测量/绘制工具：startDraw(kind, { onDone, onUpdate })；双击完成，Esc 取消 */
+    startDraw: (kind, handlers = {}) => {
+      const map = mapRef.current;
+      if (!map) return;
+      stopDrawRef.current?.();
+      const points = [];
+      let srcId = "draw-layer";
+      const ensureSource = () => {
+        try {
+          if (!map.getSource(srcId)) {
+            map.addSource(srcId, { type: "geojson", data: { type: "FeatureCollection", features: [] } });
+            if (kind === "measure-polygon" || kind === "draw-point") {
+              if (!map.getLayer("draw-fill")) {
+                map.addLayer({ id: "draw-fill", type: "fill", source: srcId, paint: { "fill-color": 令牌色("map-draw-accent"), "fill-opacity": 0.2 } });
+              }
+            }
+            if (!map.getLayer("draw-line")) {
+              map.addLayer({ id: "draw-line", type: "line", source: srcId, paint: { "line-color": 令牌色("map-draw-accent"), "line-width": 2 } });
+            }
+            if (!map.getLayer("draw-dots")) {
+              map.addLayer({ id: "draw-dots", type: "circle", source: srcId, paint: { "circle-color": 令牌色("map-draw-accent"), "circle-radius": 4 } });
+            }
+          }
+        } catch {}
+      };
+      const render = () => {
+        ensureSource();
+        const feats = [];
+        if (kind === "draw-point" && points.length) {
+          feats.push({ type: "Feature", properties: {}, geometry: { type: "Point", coordinates: points[0] } });
+        } else if (kind === "measure-line") {
+          if (points.length >= 2) feats.push({ type: "Feature", properties: {}, geometry: { type: "LineString", coordinates: points } });
+          if (points.length >= 1) feats.push({ type: "Feature", properties: {}, geometry: { type: "Point", coordinates: points[points.length - 1] } });
+        } else {
+          if (points.length >= 3) feats.push({ type: "Feature", properties: {}, geometry: { type: "Polygon", coordinates: [[...points, points[0]]] } });
+          feats.push(...points.map((c) => ({ type: "Feature", properties: {}, geometry: { type: "Point", coordinates: c } })));
+        }
+        try { map.getSource(srcId)?.setData({ type: "FeatureCollection", features: feats }); } catch {}
+        handlers.onUpdate?.(points);
+      };
+      const onClick = (e) => {
+        points.push([e.lngLat.lng, e.lngLat.lat]);
+        render();
+        if (kind === "draw-point") {
+          handlers.onDone?.(points, { kind });
+          stopDrawRef.current?.();
+        }
+      };
+      const onDblClick = (e) => {
+        e.preventDefault?.();
+        if (points.length >= 2) {
+          handlers.onDone?.(points, { kind });
+          stopDrawRef.current?.();
+        }
+      };
+      const onKey = (e) => {
+        if (e.key === "Escape") stopDrawRef.current?.();
+      };
+      map.on("click", onClick);
+      map.on("dblclick", onDblClick);
+      map.on("keydown", onKey);
+      drawModeRef.current = true;
+      stopDrawRef.current = () => {
+        map.off("click", onClick);
+        map.off("dblclick", onDblClick);
+        map.off("keydown", onKey);
+        drawModeRef.current = false;
+        stopDrawRef.current = null;
+        try {
+          if (map.getLayer("draw-fill")) map.removeLayer("draw-fill");
+          if (map.getLayer("draw-line")) map.removeLayer("draw-line");
+          if (map.getLayer("draw-dots")) map.removeLayer("draw-dots");
+          if (map.getSource(srcId)) map.removeSource(srcId);
+        } catch {}
+      };
+    },
+    stopDraw: () => stopDrawRef.current?.(),
+    /** 点击选点（等时圈起点）：pickLocation(onPick) */
+    pickLocation: (onPick) => {
+      const map = mapRef.current;
+      if (!map) return;
+      const onClick = (e) => {
+        map.off("click", onClick);
+        drawModeRef.current = false;
+        onPick?.([e.lngLat.lng, e.lngLat.lat]);
+      };
+      map.on("click", onClick);
+      drawModeRef.current = true;
+    },
+  }), [applyStyle, project, reloadStyleNow]);
+
+  // 导入文件：GeoJSON 直传；SHP 用 shpjs 解析后上传
+  const handleImportFiles = useCallback(async (files) => {
+    if (!files || !files.length) return;
+    setImporting(true);
+    setMsg("解析中…");
+    try {
+      const geoFiles = [...files].filter((f) => /\.(geojson|json)$/i.test(f.name));
+      const shpSet = [...files].filter((f) => /\.(shp|dbf|prj|cpg)$/i.test(f.name));
+      const zipFile = [...files].find((f) => /\.zip$/i.test(f.name));
+      if (geoFiles.length) {
+        const f = geoFiles[0];
+        const text = await f.text();
+        const geojson = JSON.parse(text);
+        const layerId = f.name.replace(/\.(geojson|json)$/i, "").replace(/[^\w-]/g, "_");
+        const r = await mapImportLayer(project, layerId, geojson);
+        if (!r?.ok || !r.tiles?.count) throw new Error(r?.error || "导入完成但没有生成瓦片，请检查坐标是否为 WGS84/EPSG:4326");
+        setMsg(`已导入 ${layerId}（${geojson.features?.length || "?"} 要素，${r.tiles?.count || 0} 瓦片）`);
+        await onLayerTilesChanged?.([layerId]);
+      } else if (zipFile) {
+        const parsed = await shp(await zipFile.arrayBuffer());
+        const geojson = Array.isArray(parsed) ? parsed.find((item) => item?.type === "FeatureCollection") : parsed;
+        if (!geojson) throw new Error("ZIP 中没有找到可识别的 SHP 图层");
+        const layerId = zipFile.name.replace(/\.zip$/i, "").replace(/[^\w-]/g, "_");
+        const r = await mapImportLayer(project, layerId, geojson);
+        if (!r?.ok || !r.tiles?.count) throw new Error(r?.error || "导入完成但没有生成瓦片，请检查坐标是否为 WGS84/EPSG:4326");
+        setMsg("已导入 " + layerId + "（" + (geojson.features?.length || "?") + " 要素，" + (r.tiles?.count || 0) + " 瓦片）");
+        await onLayerTilesChanged?.([layerId]);
+      } else if (shpSet.length) {
+        const shpFile = shpSet.find((f) => /\.shp$/i.test(f.name));
+        if (!shpFile) { setMsg("缺少 .shp 文件"); setImporting(false); return; }
+        const geojson = await parseShapefile(shp, shpFile, [...files]);
+        const layerId = shpFile.name.replace(/\.shp$/i, "").replace(/[^\w-]/g, "_");
+        const r = await mapImportLayer(project, layerId, geojson);
+        if (!r?.ok || !r.tiles?.count) throw new Error(r?.error || "导入完成但没有生成瓦片，请检查坐标是否为 WGS84/EPSG:4326");
+        setMsg(`已导入 ${layerId}（${geojson.features?.length || "?"} 要素，${r.tiles?.count || 0} 瓦片）`);
+        await onLayerTilesChanged?.([layerId]);
+      } else {
+        setMsg("请选择 .geojson / .json、.zip，或 .shp+.dbf(+.prj) 文件");
+      }
+    } catch (e) {
+      setMsg("导入失败: " + e.message);
+    } finally {
+      setImporting(false);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      setTimeout(() => setMsg(""), 4000);
+    }
+  }, [project, onLayerTilesChanged]);
+
+  return (
+    <div className="map-viewer">
+      <div ref={containerRef} className="map-canvas" />
+      {!loaded && (
+        <div className="map-loading">
+          {loadError ? (
+            <div className="map-load-error">
+              <span>{loadError}</span>
+              <button type="button" className="btn-sm" onClick={() => setRetryToken((v) => v + 1)}>重新加载</button>
+            </div>
+          ) : "地图加载中…"}
+        </div>
+      )}
+
+      {/* 顶部工具条（只读小地图隐藏导入入口） */}
+      {!readOnly && (
+        <div className="map-toolbar">
+          <span className="map-toolbar-title">
+            <Icon name="map" size={14} /> {config?.name || "地图"}
+          </span>
+          <label className="map-import-btn" title="导入 GeoJSON / SHP 矢量数据">
+            <Icon name="upload" size={14} /> 导入
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept=".geojson,.json,.zip,.shp,.dbf,.prj,.cpg"
+              style={{ display: "none" }}
+              onChange={(e) => handleImportFiles(e.target.files)}
+            />
+          </label>
+          <span className="map-msg">{msg}</span>
+          {importing && <Icon name="loading" size={14} className="mp-spin" />}
+        </div>
+      )}
+
+      {/* 左下状态栏 */}
+      <div className="map-status">
+        {cursor.lng !== null
+          ? `经度 ${cursor.lng}  纬度 ${cursor.lat}  缩放 ${cursor.zoom}`
+          : "浙江省交通路网与区划图 — 点击要素查看属性"}
+      </div>
+    </div>
+  );
+});
+
+export default MapViewer;

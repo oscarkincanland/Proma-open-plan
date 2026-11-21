@@ -1,0 +1,431 @@
+import fs from "node:fs";
+import path from "node:path";
+import crypto from "node:crypto";
+import { PROJECT_DIR } from "./workspace.mjs";
+import { atomicWriteJson } from "./持久化工具.mjs";
+import { RUNTIME_FLAGS } from "./运行开关.mjs";
+import { getToolMetadata } from "./工具元数据.mjs";
+
+// 工具级审批策略：参考 opencode 的 permission 模型（allow / ask / deny 三值，
+// 通配符匹配、最后匹配生效）。规则可持久化到 .oaw/permissions.json，
+// 用户在前端选择"总是允许"后会追加一条 allow 规则覆盖默认 ask。
+
+const PERMISSIONS_FILE = process.env.OAW_PERMISSIONS_FILE
+  ? path.resolve(process.env.OAW_PERMISSIONS_FILE)
+  : path.join(PROJECT_DIR, ".oaw", "permissions.json");
+const PENDING_APPROVALS_FILE = process.env.OAW_PENDING_APPROVALS_FILE
+  ? path.resolve(process.env.OAW_PENDING_APPROVALS_FILE)
+  : path.join(PROJECT_DIR, ".oaw", "pending-approvals.json");
+const APPROVAL_TIMEOUT_MS = 300000; // 5 分钟，超时视为拒绝（比 ask_user 更保守）
+
+export const APPROVAL_ACTIONS = Object.freeze(["allow", "ask", "deny"]);
+
+/**
+ * 审批边界：这些工具即使用户开启"自动批准"也必须逐次确认
+ * （正式写/破坏性/项目生命周期）。事实来源是工具元数据 forceConfirm，
+ * 这里保留一个兜底集合，避免元数据缺失时 auto 模式静默放行。
+ */
+const AUTO_APPROVE_BLOCKED_FALLBACK = Object.freeze(new Set([
+  "map_fixate_layer",
+  "map_save_analysis",
+  "map_import",
+  "map_reset",
+  "map_project_create",
+  "map_template",
+  "map_edit",
+  "editorial_pipeline",
+  "canvas_delete",
+]));
+
+/** 该工具是否禁止被 auto 模式自动批准。 */
+function mustConfirmExplicitly(toolName) {
+  const name = String(toolName || "").trim().toLowerCase();
+  if (!name) return false;
+  if (AUTO_APPROVE_BLOCKED_FALLBACK.has(name)) return true;
+  const meta = getToolMetadata(name);
+  return Boolean(meta?.forceConfirm || meta?.destructive);
+}
+
+// 默认规则：catch-all allow 在前，具体 ask/deny 在后（最后匹配生效）。
+const DEFAULT_RULES = [
+  { tool: "*", pattern: "*", action: "allow" },
+  // 外部 MCP 工具默认逐次询问；MCP 自身明确标记为只读时由调用端跳过审批。
+  { tool: "mcp", pattern: "*", action: "ask" },
+  // Office 写入类命令默认先问，避免 Agent 未经确认就改文档
+  { tool: "officecli", pattern: "set *", action: "ask" },
+  { tool: "officecli", pattern: "batch *", action: "ask" },
+  { tool: "officecli", pattern: "add *", action: "ask" },
+  { tool: "officecli", pattern: "remove *", action: "ask" },
+  { tool: "officecli", pattern: "move *", action: "ask" },
+  { tool: "officecli", pattern: "swap *", action: "ask" },
+  { tool: "officecli", pattern: "delete *", action: "ask" },
+  { tool: "officecli", pattern: "create *", action: "ask" },
+  // 编辑流水线会在工作区落一份完整文档（Formatter 原生直写），与 officecli create 同级先问
+  { tool: "editorial_pipeline", pattern: "*", action: "ask" },
+  { tool: "officecli", pattern: "import *", action: "ask" },
+  { tool: "officecli", pattern: "save *", action: "ask" },
+  { tool: "officecli", pattern: "open *", action: "ask" },
+  { tool: "officecli", pattern: "close *", action: "ask" },
+  // bash 删除/破坏类命令默认先问
+  { tool: "bash", pattern: "del *", action: "ask" },
+  { tool: "bash", pattern: "rm *", action: "ask" },
+  { tool: "bash", pattern: "rmdir *", action: "ask" },
+  { tool: "bash", pattern: "rd *", action: "ask" },
+  { tool: "bash", pattern: "remove-item *", action: "ask" },
+  { tool: "bash", pattern: "format *", action: "ask" },
+  // 地图样式/数据修改默认先问
+  { tool: "map_edit", pattern: "*", action: "ask" },
+  { tool: "map_import", pattern: "*", action: "ask" },
+  // 草稿层：不落正式库、可丢弃，免审批；固化是正式写入，必须审批。
+  { tool: "map_draft_layer", pattern: "*", action: "allow" },
+  { tool: "map_fixate_layer", pattern: "*", action: "ask" },
+  { tool: "map_save_analysis", pattern: "*", action: "ask" },
+  // 场景化模板会写 Word 报告落盘，与 officecli create 同级先问
+  { tool: "map_template", pattern: "*", action: "ask" },
+  // 工程级写操作（重置 / 新建项目）会改变整个图层树，同样逐次确认
+  { tool: "map_reset", pattern: "*", action: "ask" },
+  { tool: "map_project_create", pattern: "*", action: "ask" },
+  // 地图截图导出（2026-11-11-004）：写工作区产物文件，与导入/模板同级逐次确认
+  { tool: "map_export", pattern: "*", action: "ask" },
+  // 创作画布（2026-11-09）：写画布文件与 write 同类（默认 allow，受工作区边界）；
+  // 删除/导入/导出属交付或破坏性动作，逐次确认。
+  { tool: "canvas_read", pattern: "*", action: "allow" },
+  { tool: "canvas_write", pattern: "*", action: "allow" },
+  { tool: "canvas_delete", pattern: "*", action: "ask" },
+  { tool: "canvas_import", pattern: "*", action: "ask" },
+  { tool: "canvas_export", pattern: "*", action: "ask" },
+  // 图表工作台（2026-11-19，ADR 0041）：读写/改数据与 write 同类（默认 allow）；
+  // 删除（软删 .trash）与导出（交付产物）逐次确认，对齐 canvas_* 边界。
+  { tool: "chart_read", pattern: "*", action: "allow" },
+  { tool: "chart_write", pattern: "*", action: "allow" },
+  { tool: "chart_set_data", pattern: "*", action: "allow" },
+  { tool: "chart_delete", pattern: "*", action: "ask" },
+  { tool: "chart_export", pattern: "*", action: "ask" },
+  { tool: "board_read", pattern: "*", action: "allow" },
+  { tool: "board_write", pattern: "*", action: "allow" },
+  { tool: "board_delete", pattern: "*", action: "ask" },
+  { tool: "board_export", pattern: "*", action: "ask" },
+  { tool: "data_read", pattern: "*", action: "allow" },
+  { tool: "data_write", pattern: "*", action: "allow" },
+  { tool: "data_delete", pattern: "*", action: "ask" },
+  // 地图图层按归属细分（最后匹配生效，故置于上面的 catch-all 之后）：
+  //   shared/*    —— 共享数据集（高速公路、国省道等公共图层）只读，改样式需逐次授权，
+  //                  不允许往里新增文件（避免污染所有人共用的数据）。
+  //   workspace/* —— 当前工作区自有图层，可直接编辑。
+  // target 前缀由图层仓库 resolveLayer() 生成（阶段 1 落地）。
+  { tool: "map_import", pattern: "shared/*", action: "deny" },
+  { tool: "map_save_analysis", pattern: "shared/*", action: "deny" },
+  { tool: "map_fixate_layer", pattern: "shared/*", action: "deny" },
+  { tool: "map_edit", pattern: "shared/*", action: "ask" },
+  { tool: "map_edit", pattern: "workspace/*", action: "allow" },
+  // 敏感文件禁止写入
+  { tool: "write", pattern: "*.env", action: "deny" },
+  { tool: "write", pattern: "*.env.*", action: "deny" },
+];
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** opencode 风格通配符：* 匹配任意字符，? 匹配单个字符。 */
+export function wildcardToRegExp(pattern) {
+  const escaped = escapeRegExp(String(pattern || ""));
+  return new RegExp(`^${escaped.replace(/\\\*/g, ".*").replace(/\\\?/g, ".")}$`, "i");
+}
+
+function readPermissionConfig() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(PERMISSIONS_FILE, "utf8"));
+    return {
+      rules: Array.isArray(parsed.rules) ? parsed.rules : [],
+      mode: parsed.mode === "auto" ? "auto" : "ask",
+    };
+  } catch {
+    return { rules: [], mode: "ask" };
+  }
+}
+
+function readUserRules() {
+  return readPermissionConfig().rules;
+}
+
+function readPendingApprovals() {
+  try { return JSON.parse(fs.readFileSync(PENDING_APPROVALS_FILE, "utf8")); } catch { return []; }
+}
+
+function savePendingApprovals(items) {
+  fs.mkdirSync(path.dirname(PENDING_APPROVALS_FILE), { recursive: true });
+  atomicWriteJson(PENDING_APPROVALS_FILE, items.slice(-200));
+}
+
+/** 按 工具×输入 匹配规则，返回 action（allow/ask/deny）；最后匹配的规则生效。 */
+export function matchToolAction(tool, input) {
+  return matchToolDecision(tool, input).action;
+}
+
+function ruleSlug(value, max = 40) {
+  return String(value || "*")
+    .toLowerCase()
+    .replace(/[^a-z0-9_.*?-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, max) || "*";
+}
+
+function ruleIdFor(rule, index, source) {
+  return `${source}.${index}.${ruleSlug(rule.tool)}.${ruleSlug(rule.pattern)}.${ruleSlug(rule.action, 12)}`;
+}
+
+/**
+ * H1-2：权限决策对象。action 之外返回稳定 ruleId 与来源，便于审计与回放。
+ * 兼容：matchToolAction 仍只返回 action；旧调用方不受影响。
+ * @returns {{action:"allow"|"ask"|"deny", ruleId:string, ruleSource:string, matchedTool:string, matchedPattern:string, reason:string, mode:string}}
+ */
+export function matchToolDecision(tool, input) {
+  const toolName = String(tool || "").trim().toLowerCase();
+  const inputText = String(input || "").trim();
+  const config = readPermissionConfig();
+  const defaults = DEFAULT_RULES.map((rule, index) => ({ ...rule, __source: "default", __index: index }));
+  const users = (Array.isArray(config.rules) ? config.rules : []).map((rule, index) => ({ ...rule, __source: "user", __index: index }));
+  const rules = [...defaults, ...users];
+  let matched = {
+    action: "allow",
+    ruleId: ruleIdFor({ tool: "*", pattern: "*", action: "allow" }, 0, "default"),
+    ruleSource: "default",
+    matchedTool: "*",
+    matchedPattern: "*",
+    reason: "默认允许",
+  };
+  for (const rule of rules) {
+    if (!rule || !APPROVAL_ACTIONS.includes(rule.action)) continue;
+    const ruleTool = String(rule.tool || "*").trim().toLowerCase();
+    if (ruleTool !== "*" && ruleTool !== toolName) continue;
+    if (wildcardToRegExp(rule.pattern || "*").test(inputText || "*")) {
+      matched = {
+        action: rule.action,
+        ruleId: ruleIdFor(rule, rule.__index, rule.__source),
+        ruleSource: rule.__source,
+        matchedTool: ruleTool,
+        matchedPattern: String(rule.pattern || "*"),
+        reason: rule.__source === "user" ? "用户规则命中" : "默认规则命中",
+      };
+    }
+  }
+  // 自动批准只放行默认的 ask；显式 deny 永远不能被自动批准绕过。
+  // 2026-11-07 审批边界（ADR-0025）：固化 / 导入 / 保存分析 / 模板 / 重置 / 项目变更等
+  // 正式写与破坏性操作即使 auto 模式也必须由用户显式确认，不能自动提升为 allow。
+  if (config.mode === "auto" && matched.action === "ask" && !mustConfirmExplicitly(toolName)) {
+    return {
+      ...matched,
+      action: "allow",
+      originalAction: "ask",
+      ruleId: `auto.${matched.ruleId}`,
+      ruleSource: "auto",
+      reason: "自动批准将 ask 提升为 allow",
+      mode: config.mode,
+    };
+  }
+  return { ...matched, mode: config.mode };
+}
+
+export function getApprovalMode() {
+  return readPermissionConfig().mode;
+}
+
+export function setApprovalMode(mode = "ask") {
+  const nextMode = mode === "auto" ? "auto" : "ask";
+  const config = readPermissionConfig();
+  fs.mkdirSync(path.dirname(PERMISSIONS_FILE), { recursive: true });
+  atomicWriteJson(PERMISSIONS_FILE, { rules: config.rules, mode: nextMode, updatedAt: new Date().toISOString() });
+  return { ok: true, mode: nextMode };
+}
+
+/** 追加用户规则并持久化（"总是允许"）。 */
+export function addUserRule(tool, pattern, action) {
+  if (!APPROVAL_ACTIONS.includes(action)) return { ok: false, error: `invalid action: ${action}` };
+  const config = readPermissionConfig();
+  const rules = config.rules;
+  const clean = { tool: String(tool || "*").trim().toLowerCase(), pattern: String(pattern || "*"), action };
+  rules.push(clean);
+  fs.mkdirSync(path.dirname(PERMISSIONS_FILE), { recursive: true });
+  atomicWriteJson(PERMISSIONS_FILE, { rules, mode: config.mode, updatedAt: new Date().toISOString() });
+  return { ok: true, rule: clean, rules };
+}
+
+export function listPermissionRules() {
+  const config = readPermissionConfig();
+  return { mode: config.mode, defaults: DEFAULT_RULES, user: config.rules };
+}
+
+/** 撤销“总是允许”写入的用户规则：按 tool+pattern+action 移除一条并持久化。 */
+export function removeUserRule(rule = {}) {
+  const tool = String(rule.tool || "").trim().toLowerCase();
+  const pattern = String(rule.pattern || "*");
+  const action = String(rule.action || "allow").trim().toLowerCase();
+  if (!tool || !APPROVAL_ACTIONS.includes(action)) return { ok: false, error: "invalid rule" };
+  const config = readPermissionConfig();
+  const index = config.rules.findIndex((item) =>
+    String(item?.tool || "").trim().toLowerCase() === tool
+    && String(item?.pattern || "*") === pattern
+    && String(item?.action || "").trim().toLowerCase() === action);
+  if (index < 0) return { ok: false, error: "rule not found" };
+  const rules = config.rules.filter((_, i) => i !== index);
+  fs.mkdirSync(path.dirname(PERMISSIONS_FILE), { recursive: true });
+  atomicWriteJson(PERMISSIONS_FILE, { rules, mode: config.mode, updatedAt: new Date().toISOString() });
+  return { ok: true, rules };
+}
+
+// 等待中的审批：approvalId -> { resolve, reject, item, timer }
+const pendingApprovals = new Map();
+
+function persistPendingApproval(item) {
+  const items = readPendingApprovals().filter((x) => x.id !== item.id);
+  items.push(item);
+  savePendingApprovals(items);
+}
+
+function updatePersistedApproval(id, patch) {
+  const items = readPendingApprovals();
+  const item = items.find((x) => x.id === id);
+  if (item) { Object.assign(item, patch, { resolvedAt: new Date().toISOString() }); savePendingApprovals(items); }
+}
+
+/**
+ * Qoder P1-4：交互归属规范化。
+ *
+ * 只接受 `kind ∈ {turn, subagent, session}` 且 id 非空的归属；其余一律视为「无归属」，
+ * 由调用方（agent.mjs）在开关打开时才传入——因此开关关闭时载荷与基线**逐字一致**。
+ * 本模块刻意不读运行开关：门控放在调用侧，保证纯函数可独立断言。
+ */
+export function normalizeOwner(owner) {
+  const kind = String(owner?.kind || "");
+  const id = String(owner?.id ?? "").trim();
+  if (!id) return null;
+  if (!["turn", "subagent", "session"].includes(kind)) return null;
+  return { kind, id };
+}
+
+/**
+ * 工具执行前调用：返回前为 allow（继续执行）或抛错（deny/超时/被拒绝）。
+ * ask 时挂起等待用户在前端审批（允许一次 / 总是允许 / 拒绝），
+ * 等待项持久化到 .oaw/pending-approvals.json，服务重启后仍可恢复。
+ *
+ * `owner`（可选，Qoder P1-4）：这条交互由谁发起——`turn`（本轮）/ `subagent`（子代理）/
+ * `session`（会话）。仅在传入且合法时进入 `tool_approval_request` 载荷。
+ */
+export function requireToolApproval({ entry, tool, input, runId, threadId, workspace, emit, owner = null }) {
+  const decision = matchToolDecision(tool, input);
+  const action = decision.action;
+  const audit = (payload) => {
+    if (!RUNTIME_FLAGS.permissionAudit) return;
+    // allow 默认不逐次记录（高频）；显式打开 permissionAuditAllow 才记。
+    if (action === "allow" && !RUNTIME_FLAGS.permissionAuditAllow) return;
+    try { emit?.("permission_decision", payload); } catch {}
+  };
+  if (action === "allow") {
+    audit({ tool, input: String(input || "").slice(0, 600), ...decision, runId: runId || entry?.activeRunId || null, threadId: threadId || entry?.threadId || null });
+    return Promise.resolve();
+  }
+  if (action === "deny") {
+    const error = new Error(`工具调用被权限策略拒绝（${tool}）：${String(input || "").slice(0, 200)}`);
+    error.code = "APPROVAL_DENIED";
+    error.action = "deny";
+    error.ruleId = decision.ruleId;
+    error.decision = decision;
+    audit({ tool, input: String(input || "").slice(0, 600), ...decision, runId: runId || entry?.activeRunId || null, threadId: threadId || entry?.threadId || null });
+    return Promise.reject(error);
+  }
+  const approvalId = `approval_${crypto.randomUUID().replaceAll("-", "").slice(0, 16)}`;
+  const item = {
+    id: approvalId,
+    tool,
+    input: String(input || "").slice(0, 600),
+    runId: runId || entry?.activeRunId || null,
+    threadId: threadId || entry?.threadId || null,
+    clientId: entry?.clientId || null,
+    status: "pending",
+    policyDecision: decision,
+    createdAt: new Date().toISOString(),
+  };
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pendingApprovals.delete(approvalId);
+      updatePersistedApproval(approvalId, { status: "expired", decision: "expired" });
+      const error = new Error(`工具审批等待超过 ${Math.round(APPROVAL_TIMEOUT_MS / 60000)} 分钟未获批准，已取消本次操作`);
+      error.code = "APPROVAL_TIMEOUT";
+      error.ruleId = decision.ruleId;
+      error.decision = decision;
+      reject(error);
+    }, APPROVAL_TIMEOUT_MS);
+    const settled = (decisionValue) => {
+      clearTimeout(timer);
+      pendingApprovals.delete(approvalId);
+      updatePersistedApproval(approvalId, { status: decisionValue === "allow" ? "approved" : "rejected", decision: decisionValue });
+      try {
+        emit?.("tool_approval_resolved", { id: approvalId, tool, input: item.input, runId: item.runId, decision: decisionValue, ...(RUNTIME_FLAGS.permissionAudit ? { ruleId: decision.ruleId, ruleSource: decision.ruleSource } : {}) });
+      } catch {}
+      if (decisionValue === "allow") {
+        resolve();
+      } else {
+        const error = new Error(`工具调用被用户拒绝（${tool}）：${String(input || "").slice(0, 200)}`);
+        error.code = "APPROVAL_DENIED";
+        error.action = "deny";
+        error.ruleId = decision.ruleId;
+        error.decision = decision;
+        reject(error);
+      }
+    };
+    pendingApprovals.set(approvalId, { resolve: settled, reject: settled, item, timer });
+    persistPendingApproval(item);
+    audit({ tool, input: String(input || "").slice(0, 600), ...decision, runId: item.runId, threadId: item.threadId || null, approvalId });
+    try {
+      const 归属 = normalizeOwner(owner);
+      emit?.("tool_approval_request", {
+        id: approvalId,
+        tool,
+        input: item.input,
+        runId: item.runId,
+        threadId: item.threadId,
+        workspace: workspace || entry?.workspace || null,
+        action,
+        ...(RUNTIME_FLAGS.permissionAudit ? {
+          ruleId: decision.ruleId,
+          ruleSource: decision.ruleSource,
+          matchedPattern: decision.matchedPattern,
+          reason: decision.reason,
+        } : {}),
+        // Qoder P1-4：仅在归属合法时附带（未传/非法 → 载荷与基线逐字一致）。
+        ...(归属 ? { owner: 归属 } : {}),
+      });
+    } catch {}
+  });
+}
+
+/** 前端提交审批决定。decision: allow（允许一次）/ always（总是允许）/ deny（拒绝）。 */
+export function resolveToolApproval(id, decision = "allow") {
+  const pending = pendingApprovals.get(String(id || ""));
+  const decisionNorm = String(decision || "allow").toLowerCase();
+  const allow = decisionNorm === "allow" || decisionNorm === "always";
+  if (decisionNorm === "always" && pending?.item) {
+    const { tool, input } = pending.item;
+    const pattern = input.split(/\s+/)[0] ? `${input.split(/\s+/)[0]} *` : "*";
+    addUserRule(tool, pattern, "allow");
+  }
+  if (!pending) {
+    const items = readPendingApprovals();
+    const item = items.find((x) => x.id === id && x.status === "pending");
+    if (item) {
+      item.status = allow ? "approved" : "rejected";
+      item.decision = allow ? "allow" : "deny";
+      item.resolvedAt = new Date().toISOString();
+      savePendingApprovals(items);
+      return { ok: true, recovered: true, id, decision: allow ? "allow" : "deny" };
+    }
+    return { ok: false, error: "approval not found or already resolved" };
+  }
+  pending.resolve(allow ? "allow" : "deny");
+  return { ok: true, id, decision: allow ? "allow" : "deny", always: decisionNorm === "always" };
+}
+
+export function listPendingApprovals() {
+  return readPendingApprovals().filter((x) => x.status === "pending");
+}

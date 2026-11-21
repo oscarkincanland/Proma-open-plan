@@ -1,0 +1,97 @@
+#!/usr/bin/env node
+/**
+ * 启动加载与会话恢复回归：
+ * 1. files/sessions/projects/workspaces 失败必须可解释、可重试，且保留上一次可用数据，
+ *    不得用空列表冒充“没有内容”；
+ * 2. 会话恢复不能在会话列表成功返回之前定稿，否则异步列表晚到就再也恢复不了；
+ * 3. Agent 恢复失败时历史按只读展示，并提供重试入口。
+ */
+import assert from "node:assert/strict";
+import fs from "node:fs";
+
+const read = (rel) => fs.readFileSync(new URL(rel, import.meta.url), "utf8").replace(/\r\n/g, "\n");
+const app = read("../client/src/App.jsx");
+const 样式 = read("../client/src/styles.css");
+const chatPanel = read("../client/src/components/ChatPanel.jsx");
+const 运行投影 = read("../client/src/运行展示投影.js");
+const 服务端Agent = read("../server/agent.mjs");
+const 工作产物 = read("../client/src/components/工作产物面板.jsx");
+const docxViewer = read("../client/src/components/DocxViewer.jsx");
+const excelGrid = read("../client/src/components/ExcelGrid.jsx");
+const 服务端入口 = read("../server/index.mjs");
+
+// 1. 失败不伪装空结果，逐分区记录错误
+assert.doesNotMatch(app, /catch\(\(\) => \[\]\)/, "启动加载失败不应伪装成空列表");
+assert.match(app, /setScopeStatus\("files", "error"\)/, "文件加载失败应记录错误状态");
+assert.match(app, /setScopeStatus\("sessions", "error"\)/, "会话加载失败应记录错误状态");
+assert.match(app, /setScopeStatus\("projects", "error"\)/, "项目加载失败应记录错误状态");
+assert.match(app, /setScopeStatus\("workspaces", "error"\)/, "工作区加载失败应记录错误状态");
+assert.match(app, /const setScopeError = useCallback/, "应集中记录分区错误");
+
+// 2. 保留上次可用数据 + 统一重试
+assert.match(app, /const refreshWorkspaces = useCallback/, "工作区加载应可独立重试");
+assert.match(app, /const retryStartupLoads = useCallback/, "应提供统一重试");
+assert.match(app, /className="load-recovery"/, "应展示可解释的失败提示");
+assert.match(app, /已保留上一次可用数据/, "提示应说明保留上次数据");
+assert.match(app, /LOAD_SCOPE_LABELS/, "失败提示应说明具体分区");
+
+// 2.1 会话列表热轮询：短 TTL 缓存 + 增删改主动失效，避免多标签重复全量扫描
+assert.match(服务端入口, /const SESSIONS_LIST_CACHE_MS/, "会话列表应有短 TTL 缓存");
+assert.match(服务端入口, /invalidateSessionsListCache\(\)/, "会话增删改应主动失效列表缓存");
+assert.match(服务端入口, /sessionsListCache\.payload/, "无筛选的热轮询应命中缓存");
+assert.match(服务端入口, /SESSION_LIST_FIELDS/, "标题/置顶/冻结等列表字段变化应失效缓存");
+
+// 3. 刷新进入空白新会话（已批准规则，交接文档交互 4）：
+// 会话列表就绪与否都不再自动 resume 旧会话；恢复标记仍保留给手动入口。
+assert.doesNotMatch(app, /handleSelectSession\(sess\)/, "刷新不得自动恢复上次会话");
+assert.match(app, /restoredSessionRef\.current = true;/, "恢复标记仍应存在，避免重复恢复");
+assert.match(app, /lastSessionIdRef\.current = null;/, "不得保留会自动恢复会话的旧字段");
+
+// 4. Agent 恢复失败：只读 + 重试
+assert.match(app, /resumeResult\?\.ok \? null : \{ sessionId: session\.id/, "恢复失败应记录为只读状态");
+assert.match(app, /const retrySessionResume = useCallback/, "应提供恢复重试");
+assert.match(app, /历史已加载为只读/, "应明确说明历史只读");
+assert.match(样式, /\.session-resume-warning \{/, "只读提示应有样式");
+
+// 刷新行为：画布默认关闭；画布标签按工作区恢复；仍不自动恢复上次会话
+assert.match(app, /const \[canvasTabs, setCanvasTabs\] = useState\(\[\]\)/, "画布标签默认不打开（没有内容时不显示空面板）");
+assert.match(app, /const canvasOpen = canvasTabs\.length > 0 && !canvasCollapsed/, "画布只在有标签时显示");
+assert.match(app, /loadCanvasState\(currentWorkspace\)/, "刷新后按工作区恢复画布标签");
+assert.match(app, /saveCanvasState\(currentWorkspace/, "画布标签按工作区持久化");
+assert.match(app, /刷新后必须进入[\s\S]{0,40}空白新会话/, "应有注释说明刷新进入空白新会话");
+// v0.11.42 起浏览器面板不再靠常驻 /api/browser/stream 的「首个状态」自动展开
+//（那条长连接会占满同源连接槽位）。信号只来自对话流里的工具事件，且被
+// browserAutoOpenBlockedRef 拦住：刷新后不会自动弹开。
+assert.match(app, /browserAutoOpenBlockedRef/, "刷新后不应因浏览器状态自动展开面板");
+assert.doesNotMatch(app, /browserStateSeenRef/, "旧的「首个状态」自动展开机制应已移除");
+assert.match(app, /避免上一个会话的“本轮产物”污染到当前会话/, "会话切换应重置本轮产物范围（防跨会话污染）");
+assert.match(app, /setChangesRunId\(""\);\n    setArtifactScope\("session"\);/, "会话切换应重置 runId 与范围");
+
+// 5. 对话恢复渲染一致性：内部续跑提示不得截断同一 Run 的归约
+assert.match(服务端Agent, /\[系统提醒\] 上一个回合的模型连接中断了/, "自动续跑提示必须以内部提示前缀写入");
+assert.match(运行投影, /isInternalHarnessMessage/, "内部提示判定应由运行展示投影统一提供");
+assert.match(chatPanel, /isInternalHarnessMessage\(message\)/, "历史归一化必须使用统一内部提示判定");
+assert.match(chatPanel, /isInternalHarnessMessage\(m\)/, "渲染兜底必须使用统一内部提示判定");
+assert.match(chatPanel, /backfillAssistantEntryId/, "实时结束后应回填 assistant entryId，保证分叉/版本一致");
+assert.match(运行投影, /findAssistantEntryByText/, "entryId 回填应有可测试的终稿匹配函数");
+assert.match(app, /currentDocValue/, "历史用户消息应过滤“当前文件：（无）”占位");
+assert.match(app, /entryModel/, "历史 assistant 消息应带当轮 model");
+
+// 6. 运行终态围栏 / 产物归属 / 本轮范围 / Office 预览能力
+assert.match(chatPanel, /finishedRunIdsRef/, "客户端必须有终态 Run 围栏");
+assert.match(chatPanel, /终态围栏/, "SSE 事件处理必须显式说明终态围栏");
+assert.match(chatPanel, /const finalizeId = aid \|\| lastAssistantIdRef\.current/, "run_finished 必须兜底收尾最后一个流式气泡");
+assert.match(chatPanel, /isTaskFinishing/, "模型结束后过程区必须显示“收尾中”而不是“实时”");
+assert.match(app, /artifactNotice/, "自动打开被守卫时必须有新产物入口");
+assert.match(app, /viewingOther/, "用户正在看其他文件时不得抢焦点");
+assert.match(app, /flushFileChanges/, "file_changed 必须合并刷新");
+assert.match(app, /handleArtifactScopeChange/, "切回“本轮”必须清除钉住的历史 Run");
+assert.match(工作产物, /isSuspectedArtifact/, "疑似产物必须单列");
+assert.match(工作产物, /artifactScopePinned/, "产物面板需要区分历史轮次与本轮");
+assert.match(工作产物, /疑似变更/, "疑似变更需要有独立分组提示");
+assert.match(docxViewer, /renderMode/, "Word 必须提供浏览器/高保真双渲染");
+assert.match(docxViewer, /简化编辑保存会重建 docx/, "Word 简化编辑保存必须显式警告");
+assert.match(excelGrid, /officeHtmlUrl/, "Excel 必须支持高保真只读回退");
+assert.match(excelGrid, /仅显示单元格值/, "Excel 网格必须声明只显示值");
+
+console.log("启动与会话恢复回归：通过");

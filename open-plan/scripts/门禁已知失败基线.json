@@ -1,0 +1,6 @@
+{
+  "version": 2,
+  "updatedAt": "2026-11-19",
+  "说明": "既有失败白名单：每条必须有签名、责任人、原因与过期日。新增失败不得登记，必须修掉。过期未清视为门禁失败。依据见 docs/规范/运行时验收与门禁规范.md。2026-11-19 清空：原登记的 test:ui-guard / test:component-spec / test:design-tokens / test:perf-budget 四项已随稳定版基线修复全部复绿（详见 docs/plans/2026-11-18-001-实施记录.md），白名单清零；新增失败须重新登记。",
+  "suites": []
+}
