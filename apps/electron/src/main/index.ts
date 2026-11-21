@@ -53,6 +53,13 @@ function registerProtocolsAndHandlers(): void {
 
 import { getSettings, updateSettings } from './lib/settings-service'
 import { handlePromaFileRequest } from './lib/local-file-protocol'
+import {
+  isOpenPlanEmbedEnabled,
+  startOpenPlanSidecar,
+  stopOpenPlanSidecar,
+  getOpenPlanAppUrl,
+  setOpenPlanMainWindowGetter,
+} from './open-plan-sidecar'
 
 // 处理 EPIPE 错误：当 stdout/stderr 管道被关闭时（如 electronmon 重启），忽略写入错误
 // 这在开发环境热重载时经常发生，不影响应用功能
@@ -508,9 +515,14 @@ function createWindow(): void {
   const isDev = !app.isPackaged
   const rendererPath = join(__dirname, 'renderer', 'index.html')
   const rendererEntryUrl = isDev ? 'http://127.0.0.1:5173' : pathToFileURL(rendererPath).toString()
+  // GUIJU_EMBED_OPENPLAN=1（ADR 0044）：主窗口加载 open-plan sidecar 服务（R1–R17 应用内核）
+  const openPlanAppUrl = isOpenPlanEmbedEnabled() ? getOpenPlanAppUrl() : null
   const loadMainRenderer = (): Promise<void> => {
     if (!mainWindow || mainWindow.isDestroyed()) {
       return Promise.reject(new Error('主窗口已销毁'))
+    }
+    if (openPlanAppUrl) {
+      return mainWindow.loadURL(openPlanAppUrl)
     }
     return isDev
       ? mainWindow.loadURL(rendererEntryUrl)
@@ -761,6 +773,13 @@ async function bootstrap(): Promise<void> {
     }
   }
 
+  // GUIJU_EMBED_OPENPLAN=1（ADR 0044）：先启动 open-plan sidecar 再建窗口；
+  // 失败不阻断启动（safeAwait 隔离），窗口回落加载 Proma 自身 renderer。
+  if (isOpenPlanEmbedEnabled()) {
+    setOpenPlanMainWindowGetter(() => mainWindow)
+    await safeAwait('startOpenPlanSidecar', () => startOpenPlanSidecar())
+  }
+
   // Create main window (will be shown when ready)
   createWindow()
 
@@ -941,6 +960,9 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   // 标记正在退出，让 close 事件不再阻止关闭
   setQuitting()
+
+  // 停止 open-plan sidecar（ADR 0044）：SIGTERM → 超时强杀
+  stopOpenPlanSidecar()
 
   // 中止所有活跃的 Agent 和 Chat 子进程
   stopAllAgents()
