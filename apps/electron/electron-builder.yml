@@ -7,6 +7,8 @@ copyright: Copyright © 2024-2026 Erlich Liu
 
 # Electron 版本（CI 环境 bun workspace 下无法自动检测，需显式指定）
 electronVersion: 43.2.0
+# 复用本地 node_modules/electron/dist 的二进制，避免重复下载（对齐 open-plan desktop 经验）
+electronDist: ../../node_modules/electron/dist
 
 # 目录配置
 directories:
