@@ -108,6 +108,10 @@ extraResources:
       - node_modules/**/*
       - bin/清单.json
       - bin/**/*
+      # server 反向依赖存量（架构棘轮 2 条）：scripts/lib/tiler.mjs（瓦片）与 client/src/地图/色板.js 等，
+      # client/src 为源码体积小，整目录随包以覆盖全部 server→client 依赖
+      - scripts/lib/**/*
+      - client/src/**/*
       - docs/规范/**/*
       - docs/决策记录/**/*
 
