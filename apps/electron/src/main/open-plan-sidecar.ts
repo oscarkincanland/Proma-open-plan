@@ -44,7 +44,12 @@ let readyFile = ''
 let restartTimer: ReturnType<typeof setTimeout> | null = null
 
 export function isOpenPlanEmbedEnabled(): boolean {
-  return process.env.GUIJU_EMBED_OPENPLAN === '1'
+  // GuiJu 形态（ADR 0044）：**打包产物默认启用**（双击 exe 即规聚桌面版），
+  // GUIJU_EMBED_OPENPLAN=0 显式回落 Proma 原界面。
+  // dev 环境保持默认关闭（fork 治理约定：关闭时行为与上游一致），显式 =1 启用。
+  const env = process.env.GUIJU_EMBED_OPENPLAN
+  if (app.isPackaged) return env !== '0'
+  return env === '1'
 }
 
 function resolveOpenPlanRoot(): string {

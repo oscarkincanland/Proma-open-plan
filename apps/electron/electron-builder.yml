@@ -1,9 +1,9 @@
 # electron-builder 配置
 # 文档: https://www.electron.build/configuration/configuration
 
-appId: com.proma.app
-productName: Proma
-copyright: Copyright © 2024-2026 Erlich Liu
+appId: com.openplan.app
+productName: OpenPlan
+copyright: Copyright © 2024-2026 Erlich Liu (Proma upstream, AGPL-3.0); GuiJu derivative 2026 oscarkincanland
 
 # Electron 版本（CI 环境 bun workspace 下无法自动检测，需显式指定）
 electronVersion: 43.2.0
@@ -165,6 +165,9 @@ dmg:
 # ============================================
 win:
   icon: resources/icon.ico
+  # GuiJu（ADR 0044）：无证书环境，显式禁用代码签名（winCodeSign 解压需符号链接特权，
+  # 非管理员/未开开发者模式的 Windows 无法完成；win-unpacked 分发不受影响）
+  sign: null
   target:
     - target: nsis
       arch:

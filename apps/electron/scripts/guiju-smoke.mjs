@@ -37,9 +37,11 @@ async function main() {
 
   // ---- 0. 产物结构 ----
   console.log("▶ 产物结构（Proma 壳 + open-plan 内核闭包）");
+  // ADR 0044：productName 改 OpenPlan（GuiJu 形态），兼容旧 Proma.exe 产物
+  const exeName = ["OpenPlan.exe", "Proma.exe"].find((n) => fs.existsSync(path.join(UNPACKED, n)));
   const required = [
-    // Proma 壳（electron-builder productName: Proma）
-    "Proma.exe",
+    // Proma 壳（electron-builder）
+    exeName || "OpenPlan.exe",
     "resources/app.asar",
     // open-plan 应用内核（extraResources to: open-plan）
     "resources/open-plan/server/index.mjs",
