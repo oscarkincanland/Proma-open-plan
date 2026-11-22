@@ -522,6 +522,9 @@ function createWindow(): void {
       return Promise.reject(new Error('主窗口已销毁'))
     }
     if (openPlanAppUrl) {
+      // GuiJu（ADR 0044）：sidecar 页面 ready-to-show 最长可达数十秒（服务启动 + SPA 首屏），
+      // 先显示窗口（空白 → SPA 渐现），避免「双击后长时间无窗口」被误判为启动失败。
+      if (!mainWindow.isVisible()) mainWindow.show()
       return mainWindow.loadURL(openPlanAppUrl)
     }
     return isDev
