@@ -247,7 +247,8 @@ body.resizing { cursor: col-resize; user-select: none; }
 }
 .desktop-titlebar .titlebar-btn:hover { background: var(--bg-hover, rgba(128, 128, 128, 0.18)); color: var(--text-primary); }
 .desktop-titlebar .titlebar-btn.close:hover { background: #e5484d; color: #fff; }
-body.desktop-host .app { height: calc(100vh - 34px); margin-top: 34px; }
+body.desktop-host { height: 100dvh; overflow: hidden; box-sizing: border-box; padding-top: 34px; }
+body.desktop-host .app { height: calc(100dvh - 34px); margin-top: 0; }
 /* 全屏覆盖模块（地图/知识库/技能等 module-view 与浏览器全屏画布）同样让出标题栏高度：
    .module-view 的 absolute 定位祖先缺失时相对 viewport，top 需显式偏移。 */
 body.desktop-host .module-view { inset: 34px 0 0 var(--sidebar-w); }
