@@ -1,0 +1,98 @@
+# GuiJu（open-plan × Proma）macOS 云构建（手动触发）
+#
+# 与上游 release.yml（tag 触发全平台发布）并行存在，专供 fork 仓库手动出 Mac 包：
+# - 不需要 Apple 签名证书（无签名分发：下载后右键打开或 xattr -cr 清除隔离属性）
+# - 产物不上传 Release，而是作为 workflow artifact 提供下载（保留 14 天）
+# - 额外步骤：预构建 open-plan 内核（server 依赖闭包 + client/dist），GuiJu extraResources 需要
+#
+# 使用：GitHub 仓库页 → Actions → "GuiJu macOS Build" → Run workflow
+
+name: GuiJu macOS Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: "目标架构"
+        required: true
+        default: "arm64"
+        type: choice
+        options:
+          - arm64
+          - x64
+
+permissions:
+  contents: read
+
+jobs:
+  build-mac:
+    name: build (macos, ${{ github.event.inputs.arch }})
+    runs-on: ${{ github.event.inputs.arch == 'x64' && 'macos-15-intel' || 'macos-latest' }}
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: 安装壳依赖
+        run: bun install --frozen-lockfile
+
+      - name: 准备 OfficeCLI（当前架构）
+        run: bun run --filter='@proma/electron' prepare:officecli
+
+      # ===== GuiJu 内核预构建（electron-builder extraResources ../open-plan 所需）=====
+      - name: 构建 open-plan server 依赖闭包
+        run: |
+          cd open-plan
+          npm install --omit=dev --no-audit --no-fund
+
+      - name: 构建 open-plan client/dist
+        run: |
+          cd open-plan/client
+          npm install --no-audit --no-fund
+          npx vite build
+
+      # ===== 壳构建 =====
+      - name: 构建 Electron 应用
+        run: bun run electron:build
+        working-directory: .
+
+      - name: 准备运行时依赖
+        shell: bash
+        run: |
+          bun run --filter='@proma/electron' sync:runtime-deps
+          bun run --filter='@proma/electron' rebuild:node-pty
+
+      # 无签名打包（无 Apple 证书；用户首启需右键打开或 xattr -cr）
+      - name: 打包 (macOS ${{ github.event.inputs.arch }}，无签名)
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: |
+          ARCH="${{ github.event.inputs.arch }}"
+          npx electron-builder --mac --${ARCH} --publish never
+        working-directory: apps/electron
+
+      - name: 收集产物
+        shell: bash
+        run: |
+          mkdir -p dist-artifacts
+          cp apps/electron/out/*.dmg dist-artifacts/ 2>/dev/null || true
+          cp apps/electron/out/*.zip dist-artifacts/ 2>/dev/null || true
+          ls -la dist-artifacts/
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: GuiJu-mac-${{ github.event.inputs.arch }}
+          path: dist-artifacts/*
+          retention-days: 14
+          if-no-files-found: error
