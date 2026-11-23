@@ -11,6 +11,7 @@ import SettingsPanel from "./SettingsPanel.jsx";
 import 跑马灯文本 from "./跑马灯文本.jsx";
 import 提示气泡 from "./提示气泡.jsx";
 import { notifyError, notifySuccess, askConfirm, askText } from "./Feedback.jsx";
+import { hostBridge } from "../平台/宿主.js";
 
 // 运行中的状态集合：这些会话的名字用跑马灯 + 灯效展示，一眼看出"还在跑"
 const RUNNING_SESSION_STATUSES = new Set(["running", "queued", "waiting_user", "recovering", "cancel_requested"]);
@@ -596,6 +597,24 @@ export default function SessionSidebar({ files, currentName, onOpenFile, onRefre
 
   const pickCustomWorkspace = async () => {
     if (applying || picking) return;
+    // 桌面宿主（ADR 0044）：Electron 原生模态对话框优先（服务端 PowerShell 选择器
+    // 依赖子进程弹窗，常被主窗口遮挡造成"点了没反应"的观感）；浏览器形态回退服务端。
+    const bridge = hostBridge();
+    if (bridge?.openDirectory) {
+      setApplying(true);
+      setPicking(true);
+      try {
+        const picked = await bridge.openDirectory({ title: "选择 Open Plan 可写工作区" });
+        if (picked?.canceled) return;
+        const dir = picked?.paths?.[0] || picked?.path;
+        if (!dir) return;
+        setCustomPath(dir);
+        await applyCustom();
+      } catch (e) {
+        notifyError("选择工作区失败: " + e.message);
+      } finally { setApplying(false); setPicking(false); }
+      return;
+    }
     setApplying(true);
     setPicking(true);
     setPickNotice("已打开系统文件夹对话框：请在弹出的窗口里选择文件夹（若没看到，请查看任务栏——它可能被浏览器窗口挡住）。");
@@ -622,8 +641,24 @@ export default function SessionSidebar({ files, currentName, onOpenFile, onRefre
 
   // 侧栏"+"直达（2026-11-10 流程简化）：先选文件夹，选完直接打开新建项目表单并填入路径；
   // 取消选择视为放弃，不报错、不打开面板。
+  // 桌面宿主（ADR 0044）：优先走 Electron 原生模态对话框（服务端 PowerShell 选择器
+  // 依赖子进程弹窗，常被主窗口遮挡造成"点了没反应"的观感）；浏览器形态回退服务端选择器。
   const handleNewProjectPick = async () => {
     try {
+      const bridge = hostBridge();
+      if (bridge?.openDirectory) {
+        const picked = await bridge.openDirectory({ title: "选择 Open Plan 可写工作区" });
+        if (picked?.canceled) return;
+        const dir = picked?.paths?.[0] || picked?.path;
+        if (!dir) return;
+        const check = await validateWorkspace(dir);
+        if (!check?.ok) {
+          notifyError(`无法将此目录用作项目工作区：${check?.writeAccess?.message || check?.error || "无效目录"}`);
+          return;
+        }
+        onOpenSettings?.("project", check.workspace || dir);
+        return;
+      }
       const result = await pickWorkspace();
       if (result.canceled) return;
       if (!result.ok) {
