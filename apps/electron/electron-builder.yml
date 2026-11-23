@@ -112,6 +112,7 @@ extraResources:
       # client/src 为源码体积小，整目录随包以覆盖全部 server→client 依赖
       - scripts/lib/**/*
       - client/src/**/*
+      - templates/**/*
       - docs/规范/**/*
       - docs/决策记录/**/*
 
