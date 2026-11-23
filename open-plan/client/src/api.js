@@ -26,6 +26,9 @@ export async function api(path, opts = {}) {
     // 保留服务端结构化错误信息（如 SESSION_BUSY 的占用详情），供界面区分处理
     if (data.code) error.code = data.code;
     if (data.detail) error.detail = data.detail;
+    // 2026-11-23-001：保留 HTTP 状态码。审批/提问需要区分 404（已超时/已结算 → 收起卡片）
+    // 与网络失败（保留卡片可重试），原先只能靠调用方各自 fetch 才拿得到状态码。
+    error.status = res.status;
     throw error;
   }
   return data;
@@ -206,6 +209,12 @@ export const getApprovalMode = () => api("/api/agent/approval-mode");
 export const setApprovalMode = (mode) => api("/api/agent/approval-mode", { method: "PATCH", body: JSON.stringify({ mode }) });
 export const getPermissionRules = () => api("/api/agent/permissions");
 export const removePermissionRule = (rule) => api("/api/agent/permissions/rule", { method: "DELETE", body: JSON.stringify(rule) });
+// 2026-11-23-001：审批结算 / 提问回答的通道（原来散落在 ChatPanel / PendingActionBar /
+// ApprovalBlock 三处直接 fetch，架构边界棘轮计数因此上涨）。统一走 api.js，组件不再自己拼 URL。
+export const resolveAgentApproval = (id, decision) =>
+  api("/api/agent/approval", { method: "POST", body: JSON.stringify({ id, decision }) });
+export const answerAgentQuestion = (client, thread, payload = {}) =>
+  api("/api/agent/answer", { method: "POST", body: JSON.stringify({ client, thread, ...payload }) });
 // 会话切换/新会话属于控制面：连接被占满时要能自愈，超时给足 20 秒（Runtime 可能冷启动）。
 export const createAgentThread = (client, thread, cwd, options = {}) =>
   apiControl("/api/agent/new", { method: "POST", body: JSON.stringify({ client, thread, cwd, ...options }) }, { timeoutMs: 20000 });

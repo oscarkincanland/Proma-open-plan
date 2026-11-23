@@ -35,6 +35,8 @@ import 子代理详情面板 from "./components/子代理详情面板.jsx";
 import TeamHeaderChip from "./components/TeamHeaderChip.jsx";
 import TeamPanel from "./components/TeamPanel.jsx";
 import MiniMapPreview from "./components/MiniMapPreview.jsx";
+// 桌面标题栏（ADR 0044 P5）：Proma 壳 frameless 窗口的窗口控制承接，浏览器形态不渲染
+import 桌面标题栏 from "./components/桌面标题栏.jsx";
 import { createDocTab, createViewTab, createDesignTab, designTabId, createChartTab, createSubagentTab, openCanvasTab, closeCanvasTab, reorderCanvasTabs, loadCanvasState, saveCanvasState, saveCanvasWidth, docTabId, canvasToolMeta } from "./画布状态.js";
 import { sideDrawerAllowed } from "./画布抽屉.js";
 import { useTheme } from "./theme.jsx";
@@ -2948,6 +2950,7 @@ export default function App() {
   return (
     <AppErrorBoundary>
       <div className={`app ${canvasMaximized && canvasOpen ? "canvas-maximized" : ""} ${browserFullscreen ? "browser-fullscreen" : ""} ${sidebarOpen ? "sidebar-expanded" : "sidebar-collapsed"} ${activeModule === "map" ? "map-module-active" : ""}`}>
+        <桌面标题栏 />
         <RefreshBloom />
         <FeedbackHost />
         {/* 构建版本守卫：dist 保留历史 assets，已打开的页面不会自己失效，

@@ -1,6 +1,6 @@
 import React, { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo, forwardRef, useImperativeHandle } from "react";
 import { createPortal } from "react-dom";
-import { fileToBase64, listModels, setAgentModel, compactAgentContext, getApprovalMode, setApprovalMode as saveApprovalMode, deleteSession, deleteSessions, archiveSession, archiveSessions, renameSession, forkSession, branchAgentSession, getSession, getSessionMessageVersions, getSessionGoal, setSessionGoal, sessionGoalAction, clearSessionGoal, approveMemoryProposal, rejectMemoryProposal, rollbackRun, getRun, listRuns, getTabId, listAgents, listPendingQuestions, mapDrafts } from "../api.js";
+import { fileToBase64, listModels, setAgentModel, compactAgentContext, getApprovalMode, setApprovalMode as saveApprovalMode, deleteSession, deleteSessions, archiveSession, archiveSessions, renameSession, forkSession, branchAgentSession, getSession, getSessionMessageVersions, getSessionGoal, setSessionGoal, sessionGoalAction, clearSessionGoal, approveMemoryProposal, rejectMemoryProposal, rollbackRun, getRun, listRuns, getTabId, listAgents, listPendingQuestions, mapDrafts, resolveAgentApproval, answerAgentQuestion } from "../api.js";
 import MarkdownBody from "./MarkdownBody.jsx";
 import MiniMapPreview from "./MiniMapPreview.jsx";
 import 提及菜单 from "./提及菜单.jsx";
@@ -53,6 +53,7 @@ import { stripAnswerPrefill, stripToolMarkup, hasToolMarkup } from "../工具标
 // 人机协作中枢（D2，ADR-0026，默认关）：交互坞 / 卡片 / 纯函数模型。
 import InteractionDock from "./交互/InteractionDock.jsx";
 import InteractionCard from "./交互/InteractionCard.jsx";
+import PendingActionModal from "./交互/PendingActionModal.jsx";
 import { isActiveInteraction, mergeInteractionEvent, normalizeInteraction, normalizeInteractions, sortInteractions } from "./交互/交互模型.js";
 
 // 浏览器活动统一拉起面板（用户要求实时看到访问了哪些站点）；browser_close 是收尾动作，不拉起。
@@ -5052,18 +5053,64 @@ case "runtime_connecting":
       : { ...msg, blocks: (msg.blocks || []).map((block) => (block.id === blockId ? { ...block, expired: true } : block)) });
   }, [patch]);
 
-  // 本轮被中断：把仍待回答的提问卡统一置为失效。
+  /**
+   * 审批卡结算（2026-11-23-001）。
+   *
+   * 弹窗与对话流卡片共用：把 block.decision 落定成 allow / always / deny / expired，
+   * 卡片随「已结算」收起，弹窗因 pendingApproval 变 null 自然消失。
+   * 不发请求——请求由调用方（弹窗回调 / ApprovalBlock.decide）负责，
+   * 这里只做「前端状态收口」，保证无论哪条路径结算，卡片都不会残留。
+   */
+  const markApprovalResolved = useCallback((messageId, blockId, decision) => {
+    if (!messageId || !blockId) return;
+    const next = ["allow", "always", "deny", "expired"].includes(String(decision || "")) ? String(decision) : "expired";
+    patch(messageId, (msg) => (msg.blocks || []).some((block) => block.id === blockId && block.decision)
+      ? msg
+      : { ...msg, blocks: (msg.blocks || []).map((block) => (block.id === blockId ? { ...block, decision: next } : block)) });
+  }, [patch]);
+
+  /** 按 block.id 反查所属消息后结算（弹窗只知道 block，不知道 messageId）。 */
+  const settleApprovalById = useCallback((block, decision) => {
+    const blockId = String(block?.id || "");
+    if (!blockId) return;
+    setMessages((messages) => {
+      let hit = false;
+      const next = messages.map((message) => {
+        const blocks = message.blocks || [];
+        if (!blocks.some((item) => item?.id === blockId && !item.decision)) return message;
+        hit = true;
+        return { ...message, blocks: blocks.map((item) => (item?.id === blockId && !item.decision ? { ...item, decision } : item)) };
+      });
+      return hit ? next : messages;
+    });
+  }, []);
+
+  // 本轮被中断：把仍待回答的提问卡与仍待审批的审批卡统一置为失效。
   // 服务端已经结算 ask（不会再接受回答），卡片不能继续显示成可点击状态。
-  const expireOpenAsks = useCallback(() => {
+  //
+  // 2026-11-23-001：原实现只管 `type === "ask"`，完全不管 `approval`——而审批卡的
+  // "已结算"判定是 `!block.decision`，于是 Run 结束 / agent_error / 中断三处清理都
+  // 不会给 approval 补 decision，卡片永久停在「待审批」（用户：「卡片一直留在对话栏」）。
+  const expireOpenInteractions = useCallback(() => {
     setMessages((messages) => messages.map((message) => {
       const blocks = message.blocks || [];
-      if (!blocks.some((block) => block?.type === "ask" && !block.answer && !block.expired)) return message;
+      const hasAsk = blocks.some((block) => block?.type === "ask" && !block.answer && !block.expired);
+      const hasApproval = blocks.some((block) => block?.type === "approval" && !block.decision);
+      if (!hasAsk && !hasApproval) return message;
       return {
         ...message,
-        blocks: blocks.map((block) => (block?.type === "ask" && !block.answer && !block.expired ? { ...block, expired: true, cancelled: true } : block)),
+        blocks: blocks.map((block) => {
+          if (block?.type === "ask" && !block.answer && !block.expired) return { ...block, expired: true, cancelled: true };
+          // 审批用 decision="expired" 表达「本轮已结束/未获批准」，与 allow/deny/always 区分。
+          if (block?.type === "approval" && !block.decision) return { ...block, decision: "expired" };
+          return block;
+        }),
       };
     }));
   }, []);
+
+  // 兼容旧名（多处调用点）：语义扩展后仍走同一实现。
+  const expireOpenAsks = expireOpenInteractions;
 
   const resendRef = useRef(null);
   resendRef.current = send;
@@ -5362,6 +5409,18 @@ case "runtime_connecting":
     }
     return null;
   }, [messages]);
+  // 2026-11-23-001：待审批卡片同样需要带上 messageId，弹窗结算时要按消息定位并收起。
+  const pendingApprovalRef = useMemo(() => {
+    if (!pendingApproval) return null;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const blocks = messages[index]?.blocks;
+      if (!Array.isArray(blocks)) continue;
+      if (blocks.some((block) => block?.id === pendingApproval.id)) {
+        return { ...pendingApproval, messageId: messages[index].id };
+      }
+    }
+    return pendingApproval;
+  }, [messages, pendingApproval]);
   // 提问时间窗口（服务端 ASK_TIMEOUT_MS）：到点把卡片标记为已超时，不再等用户去撞 404。
   useEffect(() => {
     if (!pendingAsk?.expiresAt) return undefined;
@@ -5759,7 +5818,7 @@ case "runtime_connecting":
                     <span>模型切换为 <b>{modelDisplayName(roundModel)}</b></span>
                   </div>
                 )}
-                <MemoMessage m={m} index={visibleStart + firstIndex} prevRole={visibleMessages[firstIndex - 1]?.role} model={roundModel || model} clientId={clientId} threadId={threadId} sessionId={sessionId} workspace={workspace} isLastAssistant={m?.role === "assistant" && m.id === lastAssistantVisibleId} versionSwitching={versionSwitching} onOpenFile={onOpenFile} onMemoryApprove={handleMemoryApprove} onMemoryReject={handleMemoryReject} onRollbackRun={handleRollbackRun} onOpenRunChanges={onOpenRunChanges} onOpenRunArtifacts={onOpenRunArtifacts} onOpenSubagent={onOpenSubagent} onAskAnswered={handleMessageAskAnswered} onAskExpired={markAskExpired} onResend={handleMessageResend} onEditMessage={handleEditMessage} onForkMessage={handleForkMessage} onRegenerate={handleRegenerateMessage} onSwitchVersion={handleSwitchVersion} onToggleTool={toggleToolExpanded} expandedToolIds={expandedToolIds} runSummary={runSummary} executionFlow={executionFlow} onOpenSettings={onOpenSettings} unifiedComposer={composerUnified} />
+                <MemoMessage m={m} index={visibleStart + firstIndex} prevRole={visibleMessages[firstIndex - 1]?.role} model={roundModel || model} clientId={clientId} threadId={threadId} sessionId={sessionId} workspace={workspace} isLastAssistant={m?.role === "assistant" && m.id === lastAssistantVisibleId} versionSwitching={versionSwitching} onOpenFile={onOpenFile} onMemoryApprove={handleMemoryApprove} onMemoryReject={handleMemoryReject} onRollbackRun={handleRollbackRun} onOpenRunChanges={onOpenRunChanges} onOpenRunArtifacts={onOpenRunArtifacts} onOpenSubagent={onOpenSubagent} onAskAnswered={handleMessageAskAnswered} onAskExpired={markAskExpired} onApprovalResolved={markApprovalResolved} onResend={handleMessageResend} onEditMessage={handleEditMessage} onForkMessage={handleForkMessage} onRegenerate={handleRegenerateMessage} onSwitchVersion={handleSwitchVersion} onToggleTool={toggleToolExpanded} expandedToolIds={expandedToolIds} runSummary={runSummary} executionFlow={executionFlow} onOpenSettings={onOpenSettings} unifiedComposer={composerUnified} />
               </React.Fragment>
             );
            }); })()}
@@ -5894,16 +5953,73 @@ case "runtime_connecting":
               <i /> {connectionNotice.message || (connectionNotice.state === "retrying" ? "模型正在重试…" : "连接已恢复")}
             </div>
           )}
-          <PendingActionBar
-            approval={pendingApproval}
+          {/* 2026-11-23-001：待审批 / 待回答改成覆盖对话栏的弹窗（用户诉求）。
+              原 `PendingActionBar` 是一条贴在输入栏上方的窄条，用户容易看不见、也容易被误以为"没反应"；
+              弹窗把阻塞动作放大到眼前，结算即收起。 */}
+          <PendingActionModal
+            approval={pendingApprovalRef}
             ask={pendingAsk}
-            onLocateApproval={locateApproval}
-            onLocateAsk={locateAsk}
-            clientId={clientId}
-            threadId={threadId}
-            onAnswered={(blockId, answer) => handleMessageAskAnswered(pendingAsk?.messageId, blockId, answer)}
-            onExpired={(blockId) => markAskExpired(pendingAsk?.messageId, blockId)}
+            now={Date.now()}
+            busy={busy}
+            onApprove={async (block, decision) => {
+              // 走 api.js 通道（2026-11-23-001）：组件不再自己拼 URL，架构边界棘轮不涨。
+              // 404 = 已超时/已在别处结算 → 收起卡片并说明；网络失败保留卡片可重试。
+              try {
+                await resolveAgentApproval(block.id, decision);
+                settleApprovalById(block, decision);
+                setAgentPhase(decision === "deny" ? "操作已被拒绝" : "审批已通过，继续执行");
+              } catch (error) {
+                if (Number(error?.status) === 404) {
+                  settleApprovalById(block, "expired");
+                  notifyError("该审批已失效（已超时或已在别处处理）");
+                  return;
+                }
+                notifyError(`审批提交失败：${error?.message || error}`);
+              }
+            }}
+            onDeny={(block) => {
+              void (async () => {
+                try {
+                  await resolveAgentApproval(block.id, "deny");
+                } catch {}
+                // 拒绝是用户的明确决定，无论服务端是否还在等待都收起卡片。
+                settleApprovalById(block, "deny");
+                setAgentPhase("操作已被拒绝");
+              })();
+            }}
+            onAnswer={async (block, value) => {
+              try {
+                await answerAgentQuestion(clientId, threadId, { answer: value });
+                handleMessageAskAnswered(block.messageId, block.id, value);
+              } catch (error) {
+                if (Number(error?.status) === 404) {
+                  markAskExpired(block.messageId, block.id);
+                  notifyError("该问题已失效（超时或已在别处回答）");
+                  return;
+                }
+                notifyError(`回答失败：${error?.message || error}`);
+              }
+            }}
+            onSkip={(block) => {
+              void (async () => {
+                try {
+                  await answerAgentQuestion(clientId, threadId, { skip: true });
+                  handleMessageAskAnswered(block.messageId, block.id, "（已跳过，按专业判断继续）");
+                } catch (error) {
+                  if (Number(error?.status) === 404) markAskExpired(block.messageId, block.id);
+                  else notifyError(`跳过失败：${error?.message || error}`);
+                }
+              })();
+            }}
+            onExpire={(block) => {
+              if (pendingApprovalRef) settleApprovalById(block, "expired");
+              else markAskExpired(block.messageId, block.id);
+            }}
+            onOpenFile={onOpenFile}
           />
+          {/* 旧窄条 PendingActionBar 已于 2026-11-23-001 删除：它和弹窗各自发一次
+              /api/agent/approval 会造成重复结算。`locateApproval` / `locateAsk`
+              仍保留，供「回到底部」等路径定位到卡片。 */}
           {/* 人机协作中枢交互坞：输入栏上方、PendingActionBar 附近；无交互不占位。 */}
           {interactionHub && (
             <InteractionDock
@@ -6877,7 +6993,7 @@ function LiveRunSummaryBar({ m }) {
 }
 
 // ========== 消息组件（Proma 风格：头部 + 无气泡长文 AI / 淡色气泡用户） ==========
-function Message({ m, model, onToggleTool, expandedToolIds = EMPTY_TOOL_IDS, onOpenFile, onMemoryApprove, onMemoryReject, onRollbackRun, onOpenRunChanges, onOpenRunArtifacts, onOpenSubagent, onAskAnswered, onAskExpired, onResend, onEditMessage, onForkMessage, onRegenerate, onSwitchVersion, isLastAssistant = false, versionSwitching = false, index, prevRole, clientId, threadId, sessionId = "", workspace = "", runSummary = null, executionFlow = null, onOpenSettings, unifiedComposer = false }) {
+function Message({ m, model, onToggleTool, expandedToolIds = EMPTY_TOOL_IDS, onOpenFile, onMemoryApprove, onMemoryReject, onRollbackRun, onOpenRunChanges, onOpenRunArtifacts, onOpenSubagent, onAskAnswered, onAskExpired, onApprovalResolved, onResend, onEditMessage, onForkMessage, onRegenerate, onSwitchVersion, isLastAssistant = false, versionSwitching = false, index, prevRole, clientId, threadId, sessionId = "", workspace = "", runSummary = null, executionFlow = null, onOpenSettings, unifiedComposer = false }) {
   // 会话流 v3 开关（计划 2026-11-14-001）。Message 与 ChatPanel 是两个同级组件，
   // 开关必须在各自作用域内读取；此前只在 ChatPanel 里声明，导致打开会话即
   // "transcriptV3 is not defined" 被错误边界捕获。
@@ -7218,9 +7334,13 @@ function Message({ m, model, onToggleTool, expandedToolIds = EMPTY_TOOL_IDS, onO
       );
     }
     if (item.kind === "approval") {
+      // 2026-11-23-001：未决审批不再在对话流的「等待审批」行里重复渲染——它由
+      // PendingActionModal 覆盖展示（用户要求「做成弹窗覆盖对话栏」）。已结算的审批
+      // 由下面的 timeline case 留一行只读回执。
+      if (!item.block?.decision) return null;
       const toolName = String(item.block?.tool || item.block?.name || "工具");
       return (
-        <TimelineRow key={item.id} icon="shield" verb="等待审批" obj={toolName} state="run" locked>
+        <TimelineRow key={item.id} icon="shield" verb={item.block.decision === "deny" ? "已拒绝" : item.block.decision === "expired" ? "已失效" : "已允许"} obj={toolName} state={item.block.decision === "deny" ? "err" : "ok"} locked>
           <ApprovalBlock block={item.block} />
         </TimelineRow>
       );
@@ -7304,12 +7424,13 @@ function Message({ m, model, onToggleTool, expandedToolIds = EMPTY_TOOL_IDS, onO
         );
       }
       case "approval": {
-        // 同理：未决审批在折叠体外；已决审批在时间流里留一行只读回执。
+        // 同理：未决审批在折叠体外（由 PendingActionModal 展示）；已决审批在时间流里留一行只读回执。
         const b = item.block || {};
         if (!b.decision) return null;
         const toolName = String(b.tool || b.name || "工具");
+        const verb = b.decision === "deny" ? "已拒绝" : b.decision === "expired" ? "已失效" : "已允许";
         return (
-          <TimelineRow key={item.id} icon="shield" verb={b.decision === "deny" ? "已拒绝" : "已允许"} obj={toolName} state={b.decision === "deny" ? "err" : "ok"}>
+          <TimelineRow key={item.id} icon="shield" verb={verb} obj={toolName} state={b.decision === "deny" ? "err" : "ok"}>
             <ApprovalBlock block={b} />
           </TimelineRow>
         );
@@ -7411,8 +7532,7 @@ function Message({ m, model, onToggleTool, expandedToolIds = EMPTY_TOOL_IDS, onO
     if (block.type === "pipeline") return <PipelineCard key={key} block={block} onOpenFile={onOpenFile} />;
     if (block.type === "browser-steps") return <BrowserStepsCard key={key} steps={block.steps || []} />;
     if (block.type === "ask") return <AskBlock key={key} block={block} clientId={clientId} threadId={threadId} onAnswered={(blockId, answer) => onAskAnswered?.(m.id, blockId, answer)} onExpired={(blockId) => onAskExpired?.(m.id, blockId)} />;
-    if (block.type === "approval") return <ApprovalBlock key={key} block={block} />;
-    if (block.type === "text") return (
+    if (block.type === "approval") return <ApprovalBlock key={key} block={block} onExpire={(b, decision) => onApprovalResolved?.(m.id, b.id, decision)} />;    if (block.type === "text") return (
       <div className="flow-markdown process-narration" key={key}>
         <SafeMarkdown text={block.text} onOpenFile={onOpenFile} cwd={workspace} />
       </div>
@@ -8135,125 +8255,6 @@ function SubagentCard({ block, onOpenDetail }) {
   );
 }
 
-// ========== 主动提问卡片（ask_user：agent 遇不明确处询问用户） ==========
-/**
- * 输入栏常驻的待处理条：待审批可直接允许/拒绝，待回答可直接提交；
- * 折叠过程收起或正在回看历史时，不必先找到卡片再操作。
- */
-function PendingActionBar({ approval, ask, onLocateApproval, onLocateAsk, clientId, threadId, onAnswered, onExpired }) {
-  const [sending, setSending] = useState("");
-  const [error, setError] = useState("");
-  const [answer, setAnswer] = useState("");
-  if (!approval && !ask) return null;
-  const toolNames = { officecli: "Office CLI", bash: "命令", write: "写入文件", map_edit: "地图样式编辑", map_import: "地图数据导入" };
-  const approvalLabel = toolNames[String(approval?.tool || "").toLowerCase()] || approval?.tool || "工具";
-
-  const decide = async (decision) => {
-    if (sending || !approval?.id) return;
-    setSending("approval");
-    setError("");
-    try {
-      const res = await fetch("/api/agent/approval", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: approval.id, decision }),
-      });
-      const result = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(result.error || `审批提交失败（${res.status}）`);
-    } catch (e) { setError(e.message || "审批提交失败，请重试"); }
-    setSending("");
-  };
-
-  const submitAnswer = async (text) => {
-    const value = String(text ?? answer).trim();
-    if (!value || sending) return;
-    setSending("ask");
-    setError("");
-    try {
-      const res = await fetch("/api/agent/answer", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ client: clientId, thread: threadId, answer: value }),
-      });
-      const result = await res.json().catch(() => ({}));
-      if (res.status === 404) {
-        // 服务端已无该问题（30 分钟窗口已过或已在别处回答）：收起卡片，
-        // 而不是留一张点得动、一发就报 no pending question 的死卡片。
-        onExpired?.(ask?.id);
-        throw new Error("该问题已失效（超过 30 分钟未回答或已在别处回答），回答未提交");
-      }
-      if (!res.ok) throw new Error(result.error || `回答失败（${res.status}）`);
-      onAnswered?.(ask?.id, value);
-      setAnswer("");
-    } catch (e) { setError(e.message || "回答失败，请重试"); }
-    setSending("");
-  };
-
-  const skipAsk = async () => {
-    if (sending || !ask?.id) return;
-    setSending("ask");
-    setError("");
-    try {
-      const res = await fetch("/api/agent/answer", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ client: clientId, thread: threadId, skip: true }),
-      });
-      const result = await res.json().catch(() => ({}));
-      if (res.status === 404) {
-        onExpired?.(ask.id);
-        throw new Error("该问题已失效（超过 30 分钟未回答或已在别处回答）");
-      }
-      if (!res.ok) throw new Error(result.error || `跳过失败（${res.status}）`);
-      onAnswered?.(ask.id, "（已跳过，按专业判断继续）");
-    } catch (e) { setError(e.message || "跳过失败，请重试"); }
-    setSending("");
-  };
-
-  return (
-    <div className="pending-action-bar" role="status" aria-live="polite">
-      {approval && (
-        <>
-          <span className="pending-action-label"><Icon name="shield" size={12} /> 待审批：{approvalLabel}</span>
-          <span className="pending-action-command" title={String(approval.input || "")}>{String(approval.input || "").slice(0, 80)}</span>
-          <span className="pending-action-buttons">
-            <button className="btn primary" onClick={() => decide("allow")} disabled={Boolean(sending)}>允许一次</button>
-            <button className="btn" onClick={() => decide("deny")} disabled={Boolean(sending)}>拒绝</button>
-            <提示气泡 label="滚动到审批卡片"><button className="btn-xs" onClick={onLocateApproval} aria-label="定位到审批卡片"><Icon name="locate" size={12} /></button></提示气泡>
-          </span>
-        </>
-      )}
-      {ask && (
-        <>
-          <span className="pending-action-label"><Icon name="comment" size={12} /> 待回答：{String(ask.question || "").slice(0, 120)}</span>
-          {ask.fields?.length > 0 ? (
-            <span className="pending-action-form-hint">请在上方问题卡片填写表单后提交</span>
-          ) : (
-            <>
-              {ask.options?.length > 0 && (
-                <span className="pending-action-buttons">
-                  {ask.options.map((opt, i) => <button key={i} className="btn-xs" onClick={() => submitAnswer(opt)} disabled={Boolean(sending)}>{opt}</button>)}
-                </span>
-              )}
-              <input
-                className="pending-action-input"
-                placeholder="输入你的回答…"
-                value={answer}
-                onChange={(e) => setAnswer(e.target.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); submitAnswer(); } }}
-              />
-              <span className="pending-action-buttons">
-                <button className="btn primary" onClick={() => submitAnswer()} disabled={Boolean(sending) || !answer.trim()}>{sending === "ask" ? "…" : "发送"}</button>
-              </span>
-            </>
-          )}
-          <span className="pending-action-buttons">
-            <button className="btn" onClick={skipAsk} disabled={Boolean(sending)}>{sending === "ask" ? "…" : "跳过并继续"}</button>
-            <提示气泡 label="滚动到提问卡片"><button className="btn-xs" onClick={onLocateAsk} aria-label="定位到提问卡片"><Icon name="locate" size={12} /></button></提示气泡>
-          </span>
-        </>
-      )}
-      {error && <span className="pending-action-error" role="alert">{error}</span>}
-    </div>
-  );
-}
 
 function AskBlock({ block, clientId, threadId, onAnswered, onExpired }) {
   const [input, setInput] = useState("");
@@ -8502,7 +8503,7 @@ function useMapApprovalContext(tool, input, active) {
   return info;
 }
 
-function ApprovalBlock({ block }) {
+function ApprovalBlock({ block, onExpire }) {
   const [sending, setSending] = useState(false);
   const [error, setError] = useState("");
   const toolKey = String(block.tool || "").toLowerCase();
@@ -8519,17 +8520,22 @@ function ApprovalBlock({ block }) {
     setSending(true);
     setError("");
     try {
-      const res = await fetch("/api/agent/approval", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ id: block.id, decision }),
-      });
-      const result = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(result.error || `审批提交失败（${res.status}）`);
+      await resolveAgentApproval(block.id, decision);
+      // 成功也立刻收起：不等 tool_approval_resolved 回传（重连/丢帧时可能漏发）。
+      onExpire?.(block, String(decision));
     } catch (e) {
+      if (Number(e?.status) === 404) {
+        // 审批已超时/已在别处结算（服务端 APPROVAL_TIMEOUT_MS 5 分钟）。此时 Agent 侧
+        // 早已 reject，点与不点都不会执行——直接收起卡片，避免用户反复点、每次都撞 404。
+        onExpire?.(block, "expired");
+        setError("该审批已失效（已超时或已在别处处理），本轮操作不会执行");
+        return;
+      }
+      // 网络层失败（服务不可达）不能判为失效，保留卡片让用户重试。
       setError(e.message || "审批提交失败，请重试");
+    } finally {
+      setSending(false);
     }
-    setSending(false);
   };
 
   return (

@@ -148,6 +148,17 @@ async function spawnSidecar(): Promise<ChildProcess> {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   })
+  // GuiJu 诊断（ADR 0044）：spawn 失败（ENOENT/EACCES 等）只触发 error 事件，
+  // 不触发 exit——此前无监听导致 60s 空等 + 静默回落 Proma 界面。
+  proc.on('error', (error) => {
+    console.error(
+      `[open-plan sidecar] spawn 失败: ${String((error as Error)?.message || error)}；` +
+        `execPath=${process.execPath} entry=${args[0]} cwd=${root}`,
+    )
+  })
+  console.log(
+    `[open-plan sidecar] spawn 参数: execPath=${process.execPath} entry=${entry} root=${root} out=${readyFile}`,
+  )
   proc.stdout?.on('data', (chunk: Buffer) => {
     const text = String(chunk).trim()
     if (text) console.log('[open-plan sidecar]', text)

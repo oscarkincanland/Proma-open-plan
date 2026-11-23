@@ -210,6 +210,44 @@ body.resizing { cursor: col-resize; user-select: none; }
   outline-offset: 1px;
 }
 .app { display: flex; height: 100vh; overflow: hidden; }
+/* 桌面标题栏（ADR 0044 P5）：Proma 壳 frameless 窗口的窗口控制承接。
+   仅桌面宿主渲染（body.desktop-host 由桌面标题栏组件挂载/卸载）；
+   顶栏整条可拖动（app-region: drag），三键 no-drag。 */
+.desktop-titlebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-left: 12px;
+  z-index: var(--z-confirm);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;
+  user-select: none;
+}
+.desktop-titlebar .titlebar-logo { display: flex; align-items: center; color: var(--accent); }
+.desktop-titlebar .titlebar-name { font-size: 12px; color: var(--text-secondary); letter-spacing: 0.2px; }
+.desktop-titlebar .titlebar-spacer { flex: 1; }
+.desktop-titlebar .titlebar-btn {
+  -webkit-app-region: no-drag;
+  width: 46px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 0;
+}
+.desktop-titlebar .titlebar-btn:hover { background: var(--bg-hover, rgba(128, 128, 128, 0.18)); color: var(--text-primary); }
+.desktop-titlebar .titlebar-btn.close:hover { background: #e5484d; color: #fff; }
+body.desktop-host .app { height: calc(100vh - 34px); margin-top: 34px; }
 /* 主布局外壳（P1-5）：可见时用 display:contents 保持原有 flex/定位链；
    隐藏知识库/模板库时只 display:none，不卸载 —— 保住 ChatPanel 的消息与 SSE 游标。 */
 .app-main-shell { display: contents; }
@@ -13978,7 +14016,11 @@ button.run-result-chip:hover { border-color: var(--accent); color: var(--accent)
 }
 .canvas-side-resizer { flex: 0 0 4px; }
 .canvas-body-doc, .canvas-body-artifacts, .canvas-body-changes, .canvas-body-browser,
-.canvas-body-objects, .canvas-body-workflows, .canvas-body-subagent, .canvas-body-start {
+.canvas-body-objects, .canvas-body-workflows, .canvas-body-subagent, .canvas-body-start,
+/* 2026-11-23-001：design / chartWorkbench 曾漏在本组外——`.app-canvas-body` 的 flex:1 被
+   默认 min-height:auto 破坏，画布 viewport 量到 0 高度 → boardsFitViewport 返回 null →
+   不自动适配、板全落在可视区外。表现为「第二个及以后的创作画布整块空白」。 */
+.canvas-body-design, .canvas-body-chart {
   flex: 1;
   min-height: 0;
   background: var(--panel-bg);
@@ -15504,3 +15546,113 @@ button.run-result-chip:hover { border-color: var(--accent); color: var(--accent)
   opacity: 0;
 }
 [data-transcript-v3="1"] .run-activity-fold > summary { color: var(--muted); }
+
+/* ===== 待处理动作弹窗（2026-11-23-001）=====
+   用户诉求：审批 / 提问卡片不要一直躺在对话栏里。
+   形态：覆盖对话栏的模态弹层，结算（成功/失败/超时/放弃）即收起。
+   层级走 --z-confirm（高于对话栏与画布），点击遮罩不关闭——这是阻塞式动作。 */
+.pending-modal-mask {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-confirm);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: color-mix(in srgb, var(--body-bg) 74%, transparent);
+  backdrop-filter: blur(2px);
+}
+.pending-modal {
+  display: flex;
+  flex-direction: column;
+  width: min(560px, 100%);
+  max-height: min(70vh, 640px);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--panel-bg);
+  color: var(--text);
+  box-shadow: 0 24px 60px color-mix(in srgb, var(--body-bg) 72%, transparent);
+}
+.pending-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--font-sm);
+}
+.pending-modal-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pending-modal-countdown {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border-radius: var(--radius-xs);
+  background: color-mix(in srgb, var(--warning) 16%, transparent);
+  color: var(--warning);
+  font-size: var(--font-micro);
+}
+.pending-modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 12px 14px;
+}
+.pending-modal-command {
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel2-bg);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--font-xs);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.pending-modal-question { font-size: var(--font-sm); line-height: 1.7; }
+.pending-modal-note { color: var(--muted); font-size: var(--font-xs); line-height: 1.7; }
+.pending-modal-options { display: flex; flex-wrap: wrap; gap: 6px; }
+.pending-modal-input {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--panel2-bg);
+  color: var(--text);
+  font: inherit;
+  font-size: var(--font-sm);
+  line-height: 1.6;
+}
+.pending-modal-input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.pending-modal-error { color: var(--error); font-size: var(--font-xs); }
+.pending-modal-confirm {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--warning) 40%, var(--border));
+  border-radius: var(--radius-md);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  font-size: var(--font-xs);
+}
+.pending-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+}
+@media (max-width: 768px) {
+  .pending-modal-mask { padding: 12px; align-items: flex-end; }
+  .pending-modal { width: 100%; max-height: 82vh; }
+  .pending-modal-actions { justify-content: stretch; }
+  .pending-modal-actions .btn { flex: 1 1 auto; }
+}

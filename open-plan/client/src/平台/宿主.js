@@ -67,6 +67,22 @@ function createPromaBridge(api) {
         try { return await api.browserSetVisible(String(key), visible !== false); } catch { return { ok: false }; }
       },
     },
+    // 窗口控制（ADR 0044 P5：Proma 壳 frameless 窗口的标题栏承接，
+    // 复用 Proma preload 既有 window:minimize/maximize/close IPC，不新增通道）
+    window: {
+      async minimize() {
+        if (typeof api.windowMinimize !== "function") return { ok: false };
+        try { await api.windowMinimize(); return { ok: true }; } catch { return { ok: false }; }
+      },
+      async toggleMaximize() {
+        if (typeof api.windowMaximize !== "function") return { ok: false };
+        try { await api.windowMaximize(); return { ok: true }; } catch { return { ok: false }; }
+      },
+      async close() {
+        if (typeof api.windowClose !== "function") return { ok: false };
+        try { await api.windowClose(); return { ok: true }; } catch { return { ok: false }; }
+      },
+    },
   };
 }
 
@@ -86,6 +102,12 @@ export function hostBridge() {
 /** 是否桌面宿主。 */
 export function isDesktopHost() {
   return Boolean(hostBridge()?.isDesktop);
+}
+
+/** 桌面窗口控制能力（仅 Proma 壳提供；浏览器形态返回 null）。 */
+export function 桌面窗口控制() {
+  if (!isDesktopHost()) return null;
+  return hostBridge()?.window || null;
 }
 
 /** 能力表：每一项都是「有没有」，不是「什么形态」。 */
