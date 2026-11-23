@@ -248,6 +248,11 @@ body.resizing { cursor: col-resize; user-select: none; }
 .desktop-titlebar .titlebar-btn:hover { background: var(--bg-hover, rgba(128, 128, 128, 0.18)); color: var(--text-primary); }
 .desktop-titlebar .titlebar-btn.close:hover { background: #e5484d; color: #fff; }
 body.desktop-host .app { height: calc(100vh - 34px); margin-top: 34px; }
+/* 全屏覆盖模块（地图/知识库/技能等 module-view 与浏览器全屏画布）同样让出标题栏高度：
+   .module-view 的 absolute 定位祖先缺失时相对 viewport，top 需显式偏移。 */
+body.desktop-host .module-view { inset: 34px 0 0 var(--sidebar-w); }
+body.desktop-host .app.sidebar-collapsed .module-view { left: 0; }
+body.desktop-host .app.browser-fullscreen .app-canvas-slot { inset: 34px 0 0 0; height: calc(100vh - 34px); }
 /* 主布局外壳（P1-5）：可见时用 display:contents 保持原有 flex/定位链；
    隐藏知识库/模板库时只 display:none，不卸载 —— 保住 ChatPanel 的消息与 SSE 游标。 */
 .app-main-shell { display: contents; }
