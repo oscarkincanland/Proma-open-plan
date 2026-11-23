@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import Logo from "./Logo.jsx";
 import { isDesktopHost, 桌面窗口控制 } from "../平台/宿主.js";
 
 /**
@@ -35,10 +36,7 @@ export default function 桌面标题栏() {
   return (
     <div className="desktop-titlebar" role="toolbar" aria-label="窗口控制">
       <span className="titlebar-logo" aria-hidden="true">
-        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.6">
-          <circle cx="12" cy="12" r="9" />
-          <path d="M12 7v10M7 12h10" strokeLinecap="round" />
-        </svg>
+        <Logo size={16} />
       </span>
       <span className="titlebar-name">Open Plan 规聚</span>
       <span className="titlebar-spacer" />
